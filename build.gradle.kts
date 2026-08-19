@@ -1,8 +1,25 @@
 plugins {
 	kotlin("jvm") version "2.4.10"
 	kotlin("plugin.serialization") version "2.4.10"
+	id("org.jetbrains.dokka") version "2.2.0"
 	`java-library`
 	`maven-publish`
+}
+
+dokka {
+	dokkaPublications.html {
+		moduleName.set("Process RPC for Kotlin")
+		moduleVersion.set(project.version.toString())
+		outputDirectory.set(layout.buildDirectory.dir("documentation/html"))
+		includes.from("README.md", "docs/architecture.md")
+	}
+	dokkaSourceSets.main {
+		sourceLink {
+			localDirectory.set(file("src/main/kotlin"))
+			remoteUrl.set(uri("https://github.com/maniramezan/process-rpc-kotlin/tree/main/src/main/kotlin"))
+			remoteLineSuffix.set("#L")
+		}
+	}
 }
 
 kotlin {
