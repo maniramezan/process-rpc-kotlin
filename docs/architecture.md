@@ -10,7 +10,20 @@ their own JSON-RPC methods and serializable DTOs.
 2. `ProcessRpcClient.start()` launches the command without blocking the caller.
 3. `ProcessRpcState` reports starting, ready, unavailable, and stopped states.
 4. `call()` assigns a numeric request ID and correlates the framed response.
-5. `close()` terminates the child and fails outstanding calls.
+5. `notify()` sends a JSON-RPC notification, which has no ID and gets no response.
+6. `notifications` publishes messages from the child that carry a `method` and no `id`.
+7. `close()` terminates the child and fails outstanding calls. Existing `notifications` collectors
+   stay subscribed across restarts.
+
+## Notifications
+
+The reader thread never waits on collectors. `notifications` is a hot `SharedFlow` with a bounded
+buffer (`notificationBufferCapacity`, default 1,024) that drops the oldest message when a collector
+falls behind. Notifications sent before anything subscribes are not replayed. Protocols that cannot
+tolerate loss should number their notifications and offer a replay method.
+
+The client does not serve requests. A child request (one with both `method` and `id`) is answered
+with JSON-RPC error `-32601`, so the child is never left waiting.
 
 ## Wire format
 

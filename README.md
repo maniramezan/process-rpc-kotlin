@@ -33,6 +33,16 @@ client.start()
 val handshake = client.call("system.handshake")
 ```
 
+Subscribe to notifications pushed by the child, such as progress or streamed events:
+
+```kotlin
+scope.launch {
+    client.notifications.collect { notification ->
+        println("${notification.method}: ${notification.params}")
+    }
+}
+```
+
 The library does not prescribe application RPC methods or DTOs. Callers exchange
 `kotlinx.serialization.json.JsonElement` values at the transport boundary.
 
