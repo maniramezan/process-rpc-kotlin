@@ -35,6 +35,10 @@ fun main() {
 			}
 			"remember" -> remembered = params
 			"recall" -> respond(id, remembered)
+			"slow" -> {
+				Thread.sleep(params.jsonObject.getValue("millis").jsonPrimitive.int.toLong())
+				respond(id, buildJsonObject { put("done", true) })
+			}
 			"exit" -> exitProcess(0)
 		}
 	}

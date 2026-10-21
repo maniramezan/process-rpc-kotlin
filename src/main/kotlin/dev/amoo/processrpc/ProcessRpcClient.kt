@@ -83,7 +83,12 @@ public class ProcessRpcClient(
 		scope.launch { runProcess() }
 	}
 
-	public suspend fun call(method: String, params: JsonElement = JsonObject(emptyMap())): JsonElement {
+	/**
+	 * Calls [method] and waits for its response. [timeoutMs] overrides the client's `callTimeoutMs` for
+	 * this call, for operations known to take minutes, such as builds; it bounds the wait for the
+	 * response, not for the process to become ready.
+	 */
+	public suspend fun call(method: String, params: JsonElement = JsonObject(emptyMap()), timeoutMs: Long? = null): JsonElement {
 		val current = awaitProcess()
 		val id = ids.getAndIncrement()
 		val deferred = CompletableDeferred<JsonElement>()
@@ -96,7 +101,7 @@ public class ProcessRpcClient(
 		}
 		try {
 			write(current, request)
-			return withTimeout(callTimeoutMs) { deferred.await() }
+			return withTimeout(timeoutMs ?: callTimeoutMs) { deferred.await() }
 		} catch (error: ProcessRpcException) {
 			throw error
 		} catch (error: Exception) {

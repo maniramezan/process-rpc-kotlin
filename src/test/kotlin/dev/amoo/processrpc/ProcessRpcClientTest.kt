@@ -20,6 +20,8 @@ import kotlinx.serialization.json.put
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class ProcessRpcClientTest {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -95,13 +97,25 @@ class ProcessRpcClientTest {
 		assertEquals(2, withTimeout(5_000) { ticks.await() }.size)
 	}
 
-	private fun fakeServer(notificationBufferCapacity: Int = 1_024): ProcessRpcClient {
+	@Test
+	fun `a per-call timeout outlasts the client default for slow operations`() = runBlocking<Unit> {
+		val client = fakeServer(callTimeoutMs = 300)
+		client.start()
+
+		val slow = client.call("slow", buildJsonObject { put("millis", 800) }, timeoutMs = 5_000)
+
+		assertEquals(true, slow.jsonObject.getValue("done").jsonPrimitive.content.toBoolean())
+		val error = assertFailsWith<ProcessRpcException> { client.call("slow", buildJsonObject { put("millis", 800) }) }
+		assertTrue(error.message.orEmpty().contains("slow"))
+	}
+
+	private fun fakeServer(notificationBufferCapacity: Int = 1_024, callTimeoutMs: Long = 10_000): ProcessRpcClient {
 		val java = ProcessHandle.current().info().command().orElse("java")
 		val classPath = System.getProperty("java.class.path")
 		return ProcessRpcClient(
 			command = { listOf(java, "-cp", classPath, "io.github.maniramezan.processrpc.FakeRpcServerKt") },
 			scope = scope,
-			callTimeoutMs = 10_000,
+			callTimeoutMs = callTimeoutMs,
 			notificationBufferCapacity = notificationBufferCapacity,
 		).also(clients::add)
 	}
