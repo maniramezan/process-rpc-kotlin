@@ -19,7 +19,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.maniramezan:process-rpc-kotlin:0.1.0")
+    implementation("com.github.maniramezan:process-rpc-kotlin:0.2.0")
 }
 ```
 
@@ -31,6 +31,12 @@ val client = ProcessRpcClient(
 )
 client.start()
 val handshake = client.call("system.handshake")
+```
+
+A slow operation, such as a build, can wait longer than the client's `callTimeoutMs`:
+
+```kotlin
+client.call("project.build", params, timeoutMs = 10 * 60_000L)
 ```
 
 Subscribe to notifications pushed by the child, such as progress or streamed events:
