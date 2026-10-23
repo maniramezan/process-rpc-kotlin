@@ -547,16 +547,16 @@ public class ProcessRpcClient(
 				}
 			} ?: throw ProcessRpcException(null, "RPC write timed out after $writeTimeoutMs ms", kind = RpcFailureKind.TIMEOUT)
 		} finally {
+			// A write the writer has started is left to finish: the writer, not this caller, owns the frame,
+			// and its own deadline stops the process if the frame can never be completed.
 			outgoing?.let { queued ->
-				val partial = synchronized(queued) {
+				synchronized(queued) {
 					queued.abandoned = true
 					if (!queued.started) {
 						queued.body = ByteArray(0)
 						queued.reservation.close()
 					}
-					queued.started && !queued.completed.isCompleted
 				}
-				if (partial) failSession(current, "RPC write was interrupted; the stream may contain a partial frame", forcibly = true)
 			}
 		}
 	}

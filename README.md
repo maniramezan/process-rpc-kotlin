@@ -152,8 +152,9 @@ cancels that scope itself.
 A call's timeout covers queueing, writing, and waiting for its response after the process becomes
 ready. Waiting for a starting process has a separate `callTimeoutMs` budget. Notifications and calls
 also have a `writeTimeoutMs` deadline, which defaults to 10 seconds and includes body encoding.
-Cancelling or timing out a write that has started stops that process and fails its other calls, because a partial frame would corrupt
-the stream. Cancelling a queued message leaves the process running.
+Cancelling a call, or letting its timeout expire, leaves the process running: a message that has
+started writing is always finished, and one still queued is skipped. Only a write that cannot finish
+within `writeTimeoutMs` stops the process, because the stream would then hold a partial frame.
 
 The constructor exposes these limits:
 

@@ -53,6 +53,51 @@ class ProcessRpcRegressionTest {
 	}
 
 	@Test
+	fun callTimeoutDuringBlockedWriteKeepsChild() = runBlocking {
+		val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+		val client = server(clientScope)
+		client.start()
+		val pid = ready(client)
+		try {
+			val busy = clientScope.async { client.call("slow", buildJsonObject { put("millis", 1_500) }) }
+			delay(200)
+
+			val error = runCatching { client.call("echo", buildJsonObject { put("blob", "x".repeat(2_000_000)) }, timeoutMs = 300) }.exceptionOrNull()
+
+			assertEquals(RpcFailureKind.TIMEOUT, (error as? ProcessRpcException)?.kind)
+			busy.await()
+			assertEquals("after", client.call("echo", buildJsonObject { put("value", "after") }).jsonObject.getValue("value").jsonPrimitive.content)
+			assertEquals(ProcessRpcState.Ready(pid), client.state.value)
+		} finally {
+			client.close()
+			clientScope.cancel()
+		}
+	}
+
+	@Test
+	fun cancellingCallerDuringBlockedWriteKeepsChild() = runBlocking {
+		val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+		val client = server(clientScope)
+		client.start()
+		val pid = ready(client)
+		try {
+			val busy = clientScope.async { client.call("slow", buildJsonObject { put("millis", 1_500) }) }
+			delay(200)
+			val caller = clientScope.launch { client.call("echo", buildJsonObject { put("blob", "x".repeat(2_000_000)) }) }
+			delay(300)
+
+			caller.cancelAndJoin()
+
+			busy.await()
+			assertEquals("after", client.call("echo", buildJsonObject { put("value", "after") }).jsonObject.getValue("value").jsonPrimitive.content)
+			assertEquals(ProcessRpcState.Ready(pid), client.state.value)
+		} finally {
+			client.close()
+			clientScope.cancel()
+		}
+	}
+
+	@Test
 	fun stopFromCancelledFinallyMustKillChild() = runBlocking {
 		val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 		val client = server(clientScope)

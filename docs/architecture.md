@@ -66,8 +66,10 @@ drops hooks, and stopping a session cancels its hooks.
 
 The per-call timeout covers queueing, writing, and receiving the response after readiness. A separate
 `writeTimeoutMs` deadline bounds body encoding and every write, including rejected child requests.
-If an active write is abandoned or times out, the client kills that process because it may have sent a partial frame.
-Cancelled queued messages are skipped. A stopped session never shares its writer with a new launch.
+The session's writer, not the caller, owns each frame, so a caller that is cancelled or times out
+never truncates one: a started write runs to completion and a queued one is skipped. If the writer
+itself cannot finish within `writeTimeoutMs`, the client kills the process, because the stream may
+then hold a partial frame. A stopped session never shares its writer with a new launch.
 
 `stop()` runs its cleanup in a non-cancellable context. It closes stdin on an IO worker and bounds
 the graceful wait, then signals termination and bounds that wait too. An independent deadline

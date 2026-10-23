@@ -167,10 +167,11 @@ class ProcessRpcLimitsTest {
 		val client = server(writeTimeoutMs = 10_000)
 		client.start()
 		client.call("pauseReading")
-		withTimeout(2_000) {
+		val error = withTimeout(2_000) {
 			assertFailsWith<ProcessRpcException> { client.call("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }, timeoutMs = 100) }
 		}
-		assertIs<ProcessRpcState.Unavailable>(client.state.value)
+		assertEquals(RpcFailureKind.TIMEOUT, error.kind)
+		assertIs<ProcessRpcState.Ready>(client.state.value)
 	}
 
 	@Test
