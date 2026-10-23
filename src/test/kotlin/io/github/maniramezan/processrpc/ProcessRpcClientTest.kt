@@ -25,7 +25,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -375,7 +374,7 @@ class ProcessRpcClientTest {
 		assertFailsWith<ProcessRpcException> { client.call("exit") }
 		eventually { (client.state.value as? ProcessRpcState.Ready)?.pid.let { it != null && it != first } }
 
-		assertEquals("hi", client.call("echo", JsonPrimitive("hi")).jsonPrimitive.content)
+		assertEquals("hi", client.call("echo", buildJsonObject { put("value", "hi") }).jsonObject.getValue("value").jsonPrimitive.content)
 	}
 
 	@Test

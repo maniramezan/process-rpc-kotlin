@@ -29,9 +29,9 @@ fun main(args: Array<String>) {
 		when (message["method"]?.jsonPrimitive?.content) {
 			"echo" -> respond(id, params)
 			"large" -> respond(id, JsonPrimitive("x".repeat(100)))
-			"respondWith" -> send(params)
+			"respondWith" -> send(params.jsonObject.getValue("body"))
 			"stderr" -> {
-				System.err.print(params.jsonPrimitive.content)
+				System.err.print(params.jsonObject.getValue("text").jsonPrimitive.content)
 				System.err.flush()
 				respond(id, JsonNull)
 			}
@@ -44,6 +44,7 @@ fun main(args: Array<String>) {
 				Thread.sleep(60_000)
 			}
 			"outOfOrder" -> {
+				send(buildJsonObject { put("jsonrpc", "2.0"); put("method", "awaitingSecond") })
 				val second = ContentLengthFraming.readMessage(input)!!.let { Json.parseToJsonElement(it.decodeToString()).jsonObject }
 				respond(second["id"], second["params"] ?: JsonNull)
 				respond(id, params)
@@ -52,6 +53,13 @@ fun main(args: Array<String>) {
 				val count = params.jsonObject.getValue("count").jsonPrimitive.int
 				repeat(count) { index -> send(buildJsonObject { put("jsonrpc", "2.0"); put("method", "tick"); put("params", buildJsonObject { put("index", index) }) }) }
 				respond(id, buildJsonObject { put("sent", count) })
+			}
+			"askClientBatch" -> {
+				send(Json.parseToJsonElement("""[{"jsonrpc":"2.0","method":"tick","params":{}},{"jsonrpc":"2.0","id":"one","method":"client.one"},{"jsonrpc":"2.0","id":2,"method":"client.two"}]"""))
+				val reply = ContentLengthFraming.readMessage(input)!!.let { Json.parseToJsonElement(it.decodeToString()).jsonArray }
+				check(reply.size == 2)
+				check(reply.map { it.jsonObject["id"] } == listOf(JsonPrimitive("one"), JsonPrimitive(2)))
+				respond(id, reply)
 			}
 			"askClient", "askClientNull" -> {
 				val requestId = if (message["method"]?.jsonPrimitive?.content == "askClientNull") JsonNull else JsonPrimitive("server-1")

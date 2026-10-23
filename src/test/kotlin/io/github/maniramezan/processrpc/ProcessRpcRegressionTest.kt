@@ -23,7 +23,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonObject
@@ -103,7 +104,7 @@ class ProcessRpcRegressionTest {
 		client.start()
 		val pid = ready(client)
 		val caller = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-		val call = caller.launch { runCatching { client.call("echo", JsonPrimitive("x".repeat(2_000_000)), timeoutMs = 5_000) } }
+		val call = caller.launch { runCatching { client.call("echo", buildJsonObject { put("payload", "x".repeat(2_000_000)) }, timeoutMs = 5_000) } }
 		try {
 			delay(500)
 			call.cancel()
@@ -127,7 +128,7 @@ class ProcessRpcRegressionTest {
 		val pid = ready(client)
 		client.call("ignoreTerm")
 		val caller = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-		val call = caller.launch { runCatching { client.call("echo", JsonPrimitive("x".repeat(2_000_000))) } }
+		val call = caller.launch { runCatching { client.call("echo", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) } }
 		delay(500)
 		val closer = thread(isDaemon = true) { client.close() }
 		try {
@@ -192,12 +193,12 @@ class ProcessRpcRegressionTest {
 		client.start()
 		val oldPid = ready(client)
 		client.call("ignoreTerm")
-		val writing = async(Dispatchers.IO) { runCatching { client.notify("large", JsonPrimitive("x".repeat(2_000_000))) } }
+		val writing = async(Dispatchers.IO) { runCatching { client.notify("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) } }
 		try {
 			delay(300)
 			client.close()
 			client.start()
-			assertEquals(JsonPrimitive("new"), withTimeout(2_000) { client.call("echo", JsonPrimitive("new")) })
+			assertEquals(buildJsonArray { add("new") }, withTimeout(2_000) { client.call("echo", buildJsonArray { add("new") }) })
 			assertTrue(alive(oldPid))
 		} finally {
 			kill(oldPid)

@@ -28,10 +28,15 @@ Both JDKs must be installed. The consumer depends on the published artifact and 
 dependencies, rather than on the root project's classes. It checks typed calls, notifications, stderr,
 graceful shutdown, and starting again. The smoke repository stays under `build/`.
 
-To verify an existing JitPack release, run the same consumer directly against its public coordinates:
+`jitpack.yml` selects JDK 21 and runs the build plus Maven-local publication. The JitPack consumer
+workflow runs for release tags and can be dispatched with a commit hash to verify the public artifact
+before tagging. It waits for JitPack's publication, then runs the isolated consumer on JVM 17.
+
+To verify an existing JitPack release or a pushed commit, run the same consumer directly against
+its public coordinates:
 
 ```bash
-./gradlew -p integration/consumer run -PrpcRepository=https://jitpack.io -PrpcCoordinates=com.github.maniramezan:process-rpc-kotlin:0.3.0 -PtestJavaVersion=17
+./gradlew -p integration/consumer run -PrpcRepository=https://jitpack.io -PrpcCoordinates=com.github.maniramezan:process-rpc-kotlin:COMMIT_OR_TAG -PtestJavaVersion=17
 ```
 
 Keep the library product-neutral. Application RPC methods, domain DTOs, Compose UI, and provider

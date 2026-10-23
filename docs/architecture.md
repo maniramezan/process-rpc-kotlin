@@ -32,8 +32,10 @@ Cancelling the supplied scope terminates its child, including when a reader is b
 ## Threads
 
 While a child runs, the client blocks two threads from `Dispatchers.IO`: one reads standard output
-and one drains standard error. A writer coroutine consumes each session's bounded queue and blocks
-an additional IO thread while writing. Caller coroutines wait for a completion signal and can cancel
+and one drains standard error. Body encoding runs on `Dispatchers.Default` with a write-count
+reservation taken first and byte reservations acquired incrementally. A bounded streaming encoder rejects oversized bodies without
+allocating the entire oversized message. A writer coroutine consumes each session's bounded queue
+and blocks an additional IO thread while writing. Caller coroutines wait for a completion signal and can cancel
 without waiting for the pipe writer. A separate daemon scheduler enforces write and shutdown
 deadlines. Termination uses `ProcessHandle` to avoid waiting for Java's pipe locks inside
 `Process.destroy()`. Descendants are captured before shutdown signals or stdin closure can orphan them.
@@ -46,8 +48,13 @@ falls behind. Notifications sent before anything subscribes are not replayed. Pr
 tolerate loss should number their notifications and offer a replay method. `standardError` behaves
 the same way with a buffer of 256 lines.
 
+Each notification receives a monotonically increasing client sequence number. `notificationEvents`
+tracks the last observed sequence separately for each collector and reports gaps through
+`droppedBefore`. A gap becomes observable when that collector resumes and receives another message;
+notifications from before subscription are excluded. Sequences continue across child restarts.
+
 The client does not serve requests. A child request (one with both `method` and `id`) is answered
-with JSON-RPC error `-32601`, so the child is never left waiting.
+with JSON-RPC error `-32601`. Batch requests receive one response array, omitting notifications.
 
 ## Cancellation and timeouts
 
@@ -58,8 +65,8 @@ Cancelling a caller cancels its `call()` normally. A call that outlives its time
 drops hooks, and stopping a session cancels its hooks.
 
 The per-call timeout covers queueing, writing, and receiving the response after readiness. A separate
-`writeTimeoutMs` deadline bounds every write, including rejected child requests. If an active write
-is abandoned or times out, the client kills that process because it may have sent a partial frame.
+`writeTimeoutMs` deadline bounds body encoding and every write, including rejected child requests.
+If an active write is abandoned or times out, the client kills that process because it may have sent a partial frame.
 Cancelled queued messages are skipped. A stopped session never shares its writer with a new launch.
 
 `stop()` runs its cleanup in a non-cancellable context. It closes stdin on an IO worker and bounds
@@ -69,7 +76,13 @@ signals processes without closing pipes on the caller's thread.
 
 `maxPendingCalls` bounds concurrent calls per launch. `maxQueuedWrites` bounds waiting messages and
 abandonment hooks; full queues fail additional sends immediately. A full queue of child-request
-rejections is a transport failure. These limits avoid launching a coroutine per child request.
+rejections fails that session with `RpcFailureKind.OVERLOADED`. `maxQueuedWriteBytes` bounds the
+combined encoded body bytes of in-progress encoders, queued messages, and the active writer. Queue
+slots are reserved before encoding; bytes are reserved before each encoded chunk is retained. Failed
+encodings and cancelled queued writes release their reservations. Completed writes release their
+body and budget before signalling completion. Caller-owned JSON trees, encoder buffers, and transient
+buffer copies are outside the encoded-byte budget. These limits avoid launching a coroutine per
+child request.
 
 ## Wire format
 
@@ -87,7 +100,9 @@ missing, duplicate, or invalid `Content-Length`, is a protocol error that stops 
 bodies share the message-size limit and are rejected before queueing. A well-framed body that is not
 valid JSON is skipped. Parsed envelopes require the JSON-RPC version, valid IDs, and exactly one
 response result or error. Errors require an integer code and string message. Explicit null results
-are accepted. Nonempty batch arrays are handled element by element; invalid envelopes stop the child.
+are accepted. Nonempty batch arrays are handled element by element; request rejections are grouped
+into one response array. Invalid envelopes stop the child. Outgoing params must be an object or array; raw
+and typed calls reject scalar and null params locally with `RpcFailureKind.INVALID_PARAMS`.
 
 Standard output is reserved for protocol frames. Child diagnostics should use standard error,
 which the client drains independently to prevent pipe backpressure and publishes on
@@ -99,4 +114,5 @@ flow buffer and 20-line diagnostic tail therefore cannot retain arbitrarily long
 
 The library does not own application methods, model providers, UI state, device automation, or
 business errors. Consumers translate `JsonElement` results and `ProcessRpcException` into their
-own domain types, directly or with the `callAs` and `paramsAs` helpers.
+own domain types, directly or with the `callAs` and `paramsAs` helpers. Exceptions and unavailable
+states carry a `RpcFailureKind`, so callers can distinguish recovery actions without parsing text.
