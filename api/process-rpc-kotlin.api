@@ -1,0 +1,128 @@
+public final class io/github/maniramezan/processrpc/BundledBinaryLocator {
+	public fun <init> (Ljava/lang/String;Ljava/lang/String;)V
+	public final fun locate ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/ContentLengthFraming {
+	public static final field DEFAULT_MAX_MESSAGE_BYTES I
+	public static final field INSTANCE Lio/github/maniramezan/processrpc/ContentLengthFraming;
+	public static final field MAX_HEADER_BYTES I
+	public final fun readMessage (Ljava/io/BufferedInputStream;I)[B
+	public static synthetic fun readMessage$default (Lio/github/maniramezan/processrpc/ContentLengthFraming;Ljava/io/BufferedInputStream;IILjava/lang/Object;)[B
+	public final fun writeMessage ([BLjava/io/OutputStream;)V
+}
+
+public final class io/github/maniramezan/processrpc/FramingException : java/io/IOException {
+	public fun <init> (Ljava/lang/String;)V
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcClient : java/lang/AutoCloseable {
+	public fun <init> (Lkotlin/jvm/functions/Function0;Ljava/util/Map;Lkotlinx/coroutines/CoroutineScope;JIJLjava/io/File;ZLio/github/maniramezan/processrpc/RestartPolicy;IJIIILkotlin/jvm/functions/Function4;)V
+	public synthetic fun <init> (Lkotlin/jvm/functions/Function0;Ljava/util/Map;Lkotlinx/coroutines/CoroutineScope;JIJLjava/io/File;ZLio/github/maniramezan/processrpc/RestartPolicy;IJIIILkotlin/jvm/functions/Function4;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun call (Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;Ljava/lang/Long;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public static synthetic fun call$default (Lio/github/maniramezan/processrpc/ProcessRpcClient;Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;Ljava/lang/Long;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+	public fun close ()V
+	public final fun getNotifications ()Lkotlinx/coroutines/flow/SharedFlow;
+	public final fun getStandardError ()Lkotlinx/coroutines/flow/SharedFlow;
+	public final fun getState ()Lkotlinx/coroutines/flow/StateFlow;
+	public final fun notify (Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public static synthetic fun notify$default (Lio/github/maniramezan/processrpc/ProcessRpcClient;Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+	public final fun start ()V
+	public final fun stop (Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcException : java/lang/Exception {
+	public fun <init> (Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/Throwable;Lkotlinx/serialization/json/JsonElement;)V
+	public synthetic fun <init> (Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/Throwable;Lkotlinx/serialization/json/JsonElement;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun getData ()Lkotlinx/serialization/json/JsonElement;
+	public final fun getRpcCode ()Ljava/lang/Integer;
+}
+
+public abstract interface class io/github/maniramezan/processrpc/ProcessRpcState {
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcState$Ready : io/github/maniramezan/processrpc/ProcessRpcState {
+	public fun <init> (J)V
+	public final fun component1 ()J
+	public final fun copy (J)Lio/github/maniramezan/processrpc/ProcessRpcState$Ready;
+	public static synthetic fun copy$default (Lio/github/maniramezan/processrpc/ProcessRpcState$Ready;JILjava/lang/Object;)Lio/github/maniramezan/processrpc/ProcessRpcState$Ready;
+	public fun equals (Ljava/lang/Object;)Z
+	public final fun getPid ()J
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcState$Starting : io/github/maniramezan/processrpc/ProcessRpcState {
+	public static final field INSTANCE Lio/github/maniramezan/processrpc/ProcessRpcState$Starting;
+	public fun equals (Ljava/lang/Object;)Z
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcState$Stopped : io/github/maniramezan/processrpc/ProcessRpcState {
+	public static final field INSTANCE Lio/github/maniramezan/processrpc/ProcessRpcState$Stopped;
+	public fun equals (Ljava/lang/Object;)Z
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/ProcessRpcState$Unavailable : io/github/maniramezan/processrpc/ProcessRpcState {
+	public fun <init> (Ljava/lang/String;Ljava/lang/Integer;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/Integer;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun component1 ()Ljava/lang/String;
+	public final fun component2 ()Ljava/lang/Integer;
+	public final fun copy (Ljava/lang/String;Ljava/lang/Integer;)Lio/github/maniramezan/processrpc/ProcessRpcState$Unavailable;
+	public static synthetic fun copy$default (Lio/github/maniramezan/processrpc/ProcessRpcState$Unavailable;Ljava/lang/String;Ljava/lang/Integer;ILjava/lang/Object;)Lio/github/maniramezan/processrpc/ProcessRpcState$Unavailable;
+	public fun equals (Ljava/lang/Object;)Z
+	public final fun getExitCode ()Ljava/lang/Integer;
+	public final fun getReason ()Ljava/lang/String;
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public abstract interface class io/github/maniramezan/processrpc/RestartPolicy {
+}
+
+public final class io/github/maniramezan/processrpc/RestartPolicy$Backoff : io/github/maniramezan/processrpc/RestartPolicy {
+	public fun <init> ()V
+	public fun <init> (IJJJ)V
+	public synthetic fun <init> (IJJJILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun component1 ()I
+	public final fun component2 ()J
+	public final fun component3 ()J
+	public final fun component4 ()J
+	public final fun copy (IJJJ)Lio/github/maniramezan/processrpc/RestartPolicy$Backoff;
+	public static synthetic fun copy$default (Lio/github/maniramezan/processrpc/RestartPolicy$Backoff;IJJJILjava/lang/Object;)Lio/github/maniramezan/processrpc/RestartPolicy$Backoff;
+	public fun equals (Ljava/lang/Object;)Z
+	public final fun getInitialDelayMs ()J
+	public final fun getMaxDelayMs ()J
+	public final fun getMaxRestarts ()I
+	public final fun getStableAfterMs ()J
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/RestartPolicy$Never : io/github/maniramezan/processrpc/RestartPolicy {
+	public static final field INSTANCE Lio/github/maniramezan/processrpc/RestartPolicy$Never;
+	public fun equals (Ljava/lang/Object;)Z
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/RpcNotification {
+	public fun <init> (Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;)V
+	public final fun component1 ()Ljava/lang/String;
+	public final fun component2 ()Lkotlinx/serialization/json/JsonElement;
+	public final fun copy (Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;)Lio/github/maniramezan/processrpc/RpcNotification;
+	public static synthetic fun copy$default (Lio/github/maniramezan/processrpc/RpcNotification;Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;ILjava/lang/Object;)Lio/github/maniramezan/processrpc/RpcNotification;
+	public fun equals (Ljava/lang/Object;)Z
+	public final fun getMethod ()Ljava/lang/String;
+	public final fun getParams ()Lkotlinx/serialization/json/JsonElement;
+	public fun hashCode ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class io/github/maniramezan/processrpc/TypedCallsKt {
+	public static final fun getProcessRpcJson ()Lkotlinx/serialization/json/Json;
+}
+
