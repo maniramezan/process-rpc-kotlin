@@ -126,8 +126,9 @@ The client never cancels its `scope`. If you pass one, cancel it when the client
 
 ## Modules
 
-The initial repository publishes one JVM artifact, `process-rpc`. Process execution is inherently
-host-specific, while the products consuming it may still use Compose Multiplatform for their UI.
+The repository publishes one JVM artifact, which JitPack serves under the repository name,
+`com.github.maniramezan:process-rpc-kotlin`. Process execution is inherently host-specific, while the
+products consuming it may still use Compose Multiplatform for their UI.
 
 ## Origin
 
