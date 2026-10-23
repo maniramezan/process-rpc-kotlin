@@ -32,6 +32,7 @@ application {
 }
 
 tasks.named<JavaExec>("run") {
+	environment = environment.filterKeys { it !in setOf("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS") }
 	javaLauncher.set(javaToolchains.launcherFor {
 		languageVersion.set(JavaLanguageVersion.of(providers.gradleProperty("testJavaVersion").orElse("21").get().toInt()))
 	})

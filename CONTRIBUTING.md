@@ -26,7 +26,9 @@ Run the isolated consumer against a build-local Maven publication as well:
 
 Both JDKs must be installed. The consumer depends on the published artifact and its transitive
 dependencies, rather than on the root project's classes. It checks typed calls, notifications, stderr,
-graceful shutdown, and starting again. The smoke repository stays under `build/`.
+graceful shutdown, and starting again. The smoke repository stays under `build/`. Test JVMs and the
+isolated consumer clear `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, and `JDK_JAVA_OPTIONS` so launcher
+diagnostics do not pollute the scripted child stderr.
 
 `jitpack.yml` selects JDK 21 and runs the build plus Maven-local publication. The JitPack consumer
 workflow runs for release tags and can be dispatched with a commit hash to verify the public artifact
