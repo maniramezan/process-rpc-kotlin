@@ -30,7 +30,8 @@ graceful shutdown, and starting again. The smoke repository stays under `build/`
 isolated consumer clear `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, and `JDK_JAVA_OPTIONS` so launcher
 diagnostics do not pollute the scripted child stderr.
 
-`jitpack.yml` selects JDK 21 and runs the build plus Maven-local publication. The JitPack consumer
+`jitpack.yml` selects JDK 21 and only publishes to Maven local; tests run in CI, so a flaky test on
+JitPack cannot fail a release artifact. The JitPack consumer
 workflow runs for release tags and can be dispatched with a commit hash to verify the public artifact
 before tagging. It waits for JitPack's publication, then runs the isolated consumer on JVM 17.
 
