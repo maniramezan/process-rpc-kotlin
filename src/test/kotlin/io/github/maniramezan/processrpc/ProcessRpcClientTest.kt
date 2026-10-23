@@ -423,9 +423,10 @@ class ProcessRpcClientTest {
 		val client = fakeServer(maxMessageBytes = 64)
 		client.start()
 
-		val error = assertFailsWith<ProcessRpcException> { client.call("echo", JsonPrimitive("x".repeat(100))) }
+		val error = assertFailsWith<ProcessRpcException> { client.call("large") }
 
 		assertTrue(error.message.orEmpty().contains("exceeds"))
+		assertIs<ProcessRpcState.Unavailable>(client.state.value)
 	}
 
 	@Serializable

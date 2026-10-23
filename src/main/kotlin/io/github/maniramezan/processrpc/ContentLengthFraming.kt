@@ -32,14 +32,17 @@ public object ContentLengthFraming {
 	 */
 	public fun readMessage(input: BufferedInputStream, maxMessageBytes: Int = DEFAULT_MAX_MESSAGE_BYTES): ByteArray? {
 		val header = readHeader(input) ?: return null
-		val length = header.lineSequence()
+		val lengths = header.lineSequence()
 			.mapNotNull { line ->
 				val parts = line.split(":", limit = 2)
 				if (parts.size == 2 && parts[0].trim().equals("Content-Length", ignoreCase = true)) {
 					parts[1].trim().toIntOrNull() ?: throw FramingException("Invalid Content-Length: ${parts[1].trim()}")
 				} else null
 			}
-			.firstOrNull() ?: throw FramingException("Missing Content-Length header")
+			.toList()
+		if (lengths.isEmpty()) throw FramingException("Missing Content-Length header")
+		if (lengths.size != 1) throw FramingException("Duplicate Content-Length headers")
+		val length = lengths.single()
 		if (length < 0) throw FramingException("Content-Length must not be negative")
 		if (length > maxMessageBytes) throw FramingException("Content-Length $length exceeds the $maxMessageBytes byte limit")
 		return input.readExactly(length)
@@ -52,7 +55,6 @@ public object ContentLengthFraming {
 		output.flush()
 	}
 
-	// Tracks the last four bytes in an Int so finding the blank line costs no allocation per byte.
 	private fun readHeader(input: BufferedInputStream): String? {
 		var header = ByteArray(64)
 		var size = 0

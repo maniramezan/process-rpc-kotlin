@@ -41,6 +41,13 @@ class ContentLengthFramingTest {
 	}
 
 	@Test
+	fun `duplicate Content-Length headers are rejected`() {
+		assertFailsWith<FramingException> {
+			ContentLengthFraming.readMessage(stream("Content-Length: 2\r\ncontent-length: 3\r\n\r\n{}x"))
+		}
+	}
+
+	@Test
 	fun `a body over the limit is rejected before it is read`() {
 		val error = assertFailsWith<FramingException> {
 			ContentLengthFraming.readMessage(stream("Content-Length: 2000000000\r\n\r\n"), maxMessageBytes = 1_024)

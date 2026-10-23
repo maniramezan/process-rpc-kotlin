@@ -23,15 +23,20 @@ their own JSON-RPC methods and serializable DTOs.
    standard input first and waits for each step. Existing `notifications` and `standardError`
    collectors stay subscribed across restarts.
 
-Each launch has a generation number. A reader or restart left over from an earlier launch can never
-change the state of a newer one, so `close()` followed by `start()` is safe at any moment.
+Each launch has a generation number and its own session, pending-call map, write queue, and background
+tasks. Registration checks the active session under the lifecycle lock. Failure and shutdown detach
+that session before completing its calls, so concurrent starts cannot have their calls swept up by
+old cleanup. Readers and delayed restarts from an older generation cannot change a newer one's state.
+Cancelling the supplied scope terminates its child, including when a reader is blocked on a pipe.
 
 ## Threads
 
 While a child runs, the client blocks two threads from `Dispatchers.IO`: one reads standard output
-and one drains standard error. Writes also run on `Dispatchers.IO`, serialized by a mutex, so a
-caller on a UI dispatcher never blocks on a full pipe. None of this work runs on the caller's
-`scope` dispatcher.
+and one drains standard error. A writer coroutine consumes each session's bounded queue and blocks
+an additional IO thread while writing. Caller coroutines wait for a completion signal and can cancel
+without waiting for the pipe writer. A separate daemon scheduler enforces write and shutdown
+deadlines. Termination uses `ProcessHandle` to avoid waiting for Java's pipe locks inside
+`Process.destroy()`. Descendants are captured before shutdown signals or stdin closure can orphan them.
 
 ## Notifications
 
@@ -49,7 +54,22 @@ with JSON-RPC error `-32601`, so the child is never left waiting.
 Cancelling a caller cancels its `call()` normally. A call that outlives its timeout throws
 `ProcessRpcException`. In both cases the child may still be working on the request; the
 `onCallAbandoned` hook lets the protocol tell it to stop, for example with an LSP-style
-`$/cancelRequest` notification.
+`$/cancelRequest` notification. Hooks run sequentially per session, with a bounded queue; overflow
+drops hooks, and stopping a session cancels its hooks.
+
+The per-call timeout covers queueing, writing, and receiving the response after readiness. A separate
+`writeTimeoutMs` deadline bounds every write, including rejected child requests. If an active write
+is abandoned or times out, the client kills that process because it may have sent a partial frame.
+Cancelled queued messages are skipped. A stopped session never shares its writer with a new launch.
+
+`stop()` runs its cleanup in a non-cancellable context. It closes stdin on an IO worker and bounds
+the graceful wait, then signals termination and bounds that wait too. An independent deadline
+forcibly kills captured processes even if closing stdin blocks. `close()` schedules escalation and
+signals processes without closing pipes on the caller's thread.
+
+`maxPendingCalls` bounds concurrent calls per launch. `maxQueuedWrites` bounds waiting messages and
+abandonment hooks; full queues fail additional sends immediately. A full queue of child-request
+rejections is a transport failure. These limits avoid launching a coroutine per child request.
 
 ## Wire format
 
@@ -63,13 +83,17 @@ Content-Length: 49\r\n
 
 Header names are case-insensitive and headers other than `Content-Length` are ignored. Headers
 are limited to 8 KiB and bodies to `maxMessageBytes` (64 MiB by default); exceeding either, or a
-missing or invalid `Content-Length`, is a protocol error that stops the child, because the stream can
-no longer be trusted. A well-framed body that is not valid JSON is skipped. Batch arrays from the
-child are handled element by element.
+missing, duplicate, or invalid `Content-Length`, is a protocol error that stops the child. Outgoing
+bodies share the message-size limit and are rejected before queueing. A well-framed body that is not
+valid JSON is skipped. Parsed envelopes require the JSON-RPC version, valid IDs, and exactly one
+response result or error. Errors require an integer code and string message. Explicit null results
+are accepted. Nonempty batch arrays are handled element by element; invalid envelopes stop the child.
 
 Standard output is reserved for protocol frames. Child diagnostics should use standard error,
 which the client drains independently to prevent pipe backpressure and publishes on
-`standardError`.
+`standardError`. The reader retains at most `maxStandardErrorLineBytes` (8 KiB by default) from each
+line, discards its remaining bytes until a newline, and marks the prefix `[truncated]`. The 256-line
+flow buffer and 20-line diagnostic tail therefore cannot retain arbitrarily long lines.
 
 ## Boundaries
 

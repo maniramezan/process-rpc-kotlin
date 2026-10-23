@@ -28,14 +28,36 @@ fun main(args: Array<String>) {
 		val params = message["params"] ?: JsonNull
 		when (message["method"]?.jsonPrimitive?.content) {
 			"echo" -> respond(id, params)
+			"large" -> respond(id, JsonPrimitive("x".repeat(100)))
+			"respondWith" -> send(params)
+			"stderr" -> {
+				System.err.print(params.jsonPrimitive.content)
+				System.err.flush()
+				respond(id, JsonNull)
+			}
+			"floodRequests" -> {
+				repeat(10_000) { index -> send(buildJsonObject { put("jsonrpc", "2.0"); put("id", "child-$index"); put("method", "client.ping") }) }
+				Thread.sleep(60_000)
+			}
+			"pauseReading" -> {
+				respond(id, JsonNull)
+				Thread.sleep(60_000)
+			}
+			"outOfOrder" -> {
+				val second = ContentLengthFraming.readMessage(input)!!.let { Json.parseToJsonElement(it.decodeToString()).jsonObject }
+				respond(second["id"], second["params"] ?: JsonNull)
+				respond(id, params)
+			}
 			"emit" -> {
 				val count = params.jsonObject.getValue("count").jsonPrimitive.int
 				repeat(count) { index -> send(buildJsonObject { put("jsonrpc", "2.0"); put("method", "tick"); put("params", buildJsonObject { put("index", index) }) }) }
 				respond(id, buildJsonObject { put("sent", count) })
 			}
-			"askClient" -> {
-				send(buildJsonObject { put("jsonrpc", "2.0"); put("id", "server-1"); put("method", "client.ping") })
+			"askClient", "askClientNull" -> {
+				val requestId = if (message["method"]?.jsonPrimitive?.content == "askClientNull") JsonNull else JsonPrimitive("server-1")
+				send(buildJsonObject { put("jsonrpc", "2.0"); put("id", requestId); put("method", "client.ping") })
 				val reply = ContentLengthFraming.readMessage(input)?.let { Json.parseToJsonElement(it.decodeToString()).jsonObject } ?: return
+				check(reply["id"] == requestId)
 				respond(id, reply["error"] ?: JsonNull)
 			}
 			"remember" -> remembered = params
@@ -93,8 +115,8 @@ private fun respond(id: JsonElement?, result: JsonElement) {
 	send(buildJsonObject { put("jsonrpc", "2.0"); put("id", id ?: JsonNull); put("result", result) })
 }
 
-private fun send(message: JsonObject) {
-	ContentLengthFraming.writeMessage(Json.encodeToString(JsonObject.serializer(), message).encodeToByteArray(), System.out)
+private fun send(message: JsonElement) {
+	ContentLengthFraming.writeMessage(Json.encodeToString(JsonElement.serializer(), message).encodeToByteArray(), System.out)
 }
 
 internal val JsonElement.intValue: Int get() = (this as JsonPrimitive).int

@@ -44,6 +44,14 @@ tasks.withType<JavaCompile>().configureEach {
 	options.release.set(17)
 }
 
+val testJavaVersion = providers.gradleProperty("testJavaVersion").map(String::toInt).orElse(21)
+
+tasks.withType<Test>().configureEach {
+	javaLauncher.set(javaToolchains.launcherFor {
+		languageVersion.set(JavaLanguageVersion.of(testJavaVersion.get()))
+	})
+}
+
 dependencies {
 	api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 	api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
@@ -51,6 +59,12 @@ dependencies {
 }
 
 publishing {
+	repositories {
+		maven {
+			name = "consumerSmoke"
+			url = layout.buildDirectory.dir("consumer-repository").get().asFile.toURI()
+		}
+	}
 	publications {
 		create<MavenPublication>("maven") {
 			from(components["java"])
@@ -68,4 +82,17 @@ publishing {
 			}
 		}
 	}
+}
+
+tasks.register<GradleBuild>("consumerSmokeTest") {
+	group = "verification"
+	description = "Publishes to a build-local Maven repository and runs an isolated Kotlin consumer."
+	dependsOn("publishMavenPublicationToConsumerSmokeRepository")
+	dir = file("integration/consumer")
+	tasks = listOf("run")
+	startParameter.projectProperties = gradle.startParameter.projectProperties + mapOf(
+		"rpcRepository" to layout.buildDirectory.dir("consumer-repository").get().asFile.absolutePath,
+		"rpcCoordinates" to "${project.group}:process-rpc:${project.version}",
+		"testJavaVersion" to testJavaVersion.get().toString(),
+	)
 }

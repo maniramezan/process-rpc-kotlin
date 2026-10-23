@@ -42,7 +42,6 @@ public class BundledBinaryLocator internal constructor(
 	private fun find(directory: File): String? =
 		candidateNames().map { File(directory, it) }.firstOrNull(::isExecutableFile)?.absolutePath
 
-	// Windows resolves `tool` to `tool.exe` and friends through PATHEXT; other platforms use the name as is.
 	private fun candidateNames(): List<String> {
 		val windows = property("os.name").orEmpty().startsWith("Windows", ignoreCase = true)
 		if (!windows || binaryName.contains('.')) return listOf(binaryName)
