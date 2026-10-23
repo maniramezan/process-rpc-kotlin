@@ -26,7 +26,9 @@ class BundledBinaryLocatorTest {
 	}
 
 	@Test
-	fun `a non-executable override is rejected`() {
+	fun `an override that is not an executable file is rejected`() {
+		assertFailsWith<IllegalArgumentException> { locator(environment = mapOf("TOOL_PATH" to dir("tools"))).locate() }
+		if (System.getProperty("os.name").startsWith("Windows")) return
 		val file = File(root, "tool").apply { writeText("") }
 
 		assertFailsWith<IllegalArgumentException> { locator(environment = mapOf("TOOL_PATH" to file.path)).locate() }
