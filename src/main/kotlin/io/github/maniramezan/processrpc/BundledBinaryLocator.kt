@@ -2,6 +2,17 @@ package io.github.maniramezan.processrpc
 
 import java.io.File
 
+/**
+ * Finds the executable that a [ProcessRpcClient] launches, typically from its `command` lambda.
+ *
+ * [locate] checks, in order:
+ * 1. the [overrideEnvironmentVariable], which must name an executable file when set;
+ * 2. the `compose.application.resources.dir` system property, which Compose Desktop sets for packaged apps;
+ * 3. each directory on `PATH`, skipping empty entries.
+ *
+ * On Windows, a [binaryName] without an extension also matches each `PATHEXT` extension, so `tool`
+ * finds `tool.exe`.
+ */
 public class BundledBinaryLocator internal constructor(
 	private val binaryName: String,
 	private val overrideEnvironmentVariable: String,
@@ -11,6 +22,12 @@ public class BundledBinaryLocator internal constructor(
 	public constructor(binaryName: String, overrideEnvironmentVariable: String) :
 		this(binaryName, overrideEnvironmentVariable, System::getenv, System::getProperty)
 
+	/**
+	 * Returns the absolute path of the first match.
+	 *
+	 * @throws IllegalArgumentException when the override variable is set but does not name an executable file.
+	 * @throws IllegalStateException when no executable is found.
+	 */
 	public fun locate(): String {
 		environment(overrideEnvironmentVariable)?.takeIf(String::isNotBlank)?.let { return executable(it) }
 		property("compose.application.resources.dir")?.let { resources ->

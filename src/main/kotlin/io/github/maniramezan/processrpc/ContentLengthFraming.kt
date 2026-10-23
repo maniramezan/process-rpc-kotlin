@@ -8,6 +8,11 @@ import java.io.OutputStream
 /** The peer violated Content-Length framing; the stream can no longer be read reliably. */
 public class FramingException(message: String) : IOException(message)
 
+/**
+ * LSP-style message framing: each message is a header block of `Name: value` lines ending in a blank
+ * line, followed by exactly `Content-Length` bytes of body. Header names are case-insensitive and
+ * headers other than `Content-Length`, such as `Content-Type`, are ignored.
+ */
 public object ContentLengthFraming {
 	/** The largest body [readMessage] accepts unless told otherwise: 64 MiB. */
 	public const val DEFAULT_MAX_MESSAGE_BYTES: Int = 64 * 1024 * 1024
@@ -17,6 +22,14 @@ public object ContentLengthFraming {
 
 	private const val HEADER_TERMINATOR = 0x0D0A0D0A
 
+	/**
+	 * Reads the next message body from [input], blocking until it has arrived in full.
+	 *
+	 * @return the body, or `null` when the stream ends cleanly between messages.
+	 * @throws FramingException when the header is missing `Content-Length`, is malformed, or exceeds
+	 *   [MAX_HEADER_BYTES], or when the body exceeds [maxMessageBytes].
+	 * @throws java.io.EOFException when the stream ends partway through a message.
+	 */
 	public fun readMessage(input: BufferedInputStream, maxMessageBytes: Int = DEFAULT_MAX_MESSAGE_BYTES): ByteArray? {
 		val header = readHeader(input) ?: return null
 		val length = header.lineSequence()
@@ -32,6 +45,7 @@ public object ContentLengthFraming {
 		return input.readExactly(length)
 	}
 
+	/** Writes [body] to [output] with a Content-Length header and flushes it. Callers must serialize concurrent writes. */
 	public fun writeMessage(body: ByteArray, output: OutputStream) {
 		output.write("Content-Length: ${body.size}\r\n\r\n".encodeToByteArray())
 		output.write(body)
