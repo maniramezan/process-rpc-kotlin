@@ -47,6 +47,8 @@ tasks.withType<JavaCompile>().configureEach {
 val testJavaVersion = providers.gradleProperty("testJavaVersion").map(String::toInt).orElse(21)
 
 tasks.withType<Test>().configureEach {
+	testLogging.exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+	environment = environment.filterKeys { it !in setOf("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS") }
 	javaLauncher.set(javaToolchains.launcherFor {
 		languageVersion.set(JavaLanguageVersion.of(testJavaVersion.get()))
 	})

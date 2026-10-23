@@ -23,7 +23,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonObject
@@ -49,6 +50,51 @@ class ProcessRpcRegressionTest {
 
 	private fun kill(pid: Long) {
 		ProcessHandle.of(pid).ifPresent { it.destroyForcibly() }
+	}
+
+	@Test
+	fun callTimeoutDuringBlockedWriteKeepsChild() = runBlocking {
+		val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+		val client = server(clientScope)
+		client.start()
+		val pid = ready(client)
+		try {
+			val busy = clientScope.async { client.call("slow", buildJsonObject { put("millis", 1_500) }) }
+			delay(200)
+
+			val error = runCatching { client.call("echo", buildJsonObject { put("blob", "x".repeat(2_000_000)) }, timeoutMs = 300) }.exceptionOrNull()
+
+			assertEquals(RpcFailureKind.TIMEOUT, (error as? ProcessRpcException)?.kind)
+			busy.await()
+			assertEquals("after", client.call("echo", buildJsonObject { put("value", "after") }).jsonObject.getValue("value").jsonPrimitive.content)
+			assertEquals(ProcessRpcState.Ready(pid), client.state.value)
+		} finally {
+			client.close()
+			clientScope.cancel()
+		}
+	}
+
+	@Test
+	fun cancellingCallerDuringBlockedWriteKeepsChild() = runBlocking {
+		val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+		val client = server(clientScope)
+		client.start()
+		val pid = ready(client)
+		try {
+			val busy = clientScope.async { client.call("slow", buildJsonObject { put("millis", 1_500) }) }
+			delay(200)
+			val caller = clientScope.launch { client.call("echo", buildJsonObject { put("blob", "x".repeat(2_000_000)) }) }
+			delay(300)
+
+			caller.cancelAndJoin()
+
+			busy.await()
+			assertEquals("after", client.call("echo", buildJsonObject { put("value", "after") }).jsonObject.getValue("value").jsonPrimitive.content)
+			assertEquals(ProcessRpcState.Ready(pid), client.state.value)
+		} finally {
+			client.close()
+			clientScope.cancel()
+		}
 	}
 
 	@Test
@@ -103,7 +149,7 @@ class ProcessRpcRegressionTest {
 		client.start()
 		val pid = ready(client)
 		val caller = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-		val call = caller.launch { runCatching { client.call("echo", JsonPrimitive("x".repeat(2_000_000)), timeoutMs = 5_000) } }
+		val call = caller.launch { runCatching { client.call("echo", buildJsonObject { put("payload", "x".repeat(2_000_000)) }, timeoutMs = 5_000) } }
 		try {
 			delay(500)
 			call.cancel()
@@ -127,7 +173,7 @@ class ProcessRpcRegressionTest {
 		val pid = ready(client)
 		client.call("ignoreTerm")
 		val caller = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-		val call = caller.launch { runCatching { client.call("echo", JsonPrimitive("x".repeat(2_000_000))) } }
+		val call = caller.launch { runCatching { client.call("echo", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) } }
 		delay(500)
 		val closer = thread(isDaemon = true) { client.close() }
 		try {
@@ -192,12 +238,12 @@ class ProcessRpcRegressionTest {
 		client.start()
 		val oldPid = ready(client)
 		client.call("ignoreTerm")
-		val writing = async(Dispatchers.IO) { runCatching { client.notify("large", JsonPrimitive("x".repeat(2_000_000))) } }
+		val writing = async(Dispatchers.IO) { runCatching { client.notify("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) } }
 		try {
 			delay(300)
 			client.close()
 			client.start()
-			assertEquals(JsonPrimitive("new"), withTimeout(2_000) { client.call("echo", JsonPrimitive("new")) })
+			assertEquals(buildJsonArray { add("new") }, withTimeout(2_000) { client.call("echo", buildJsonArray { add("new") }) })
 			assertTrue(alive(oldPid))
 		} finally {
 			kill(oldPid)

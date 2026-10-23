@@ -62,6 +62,12 @@ client.call("project.build", params, timeoutMs = 10 * 60_000L)
 Failures throw `ProcessRpcException`. When the child answered with a JSON-RPC error, `rpcCode` and
 `data` carry its `error.code` and `error.data`; both are `null` for timeouts and stopped processes.
 Cancelling the calling coroutine cancels the call as usual rather than throwing this exception.
+`kind: RpcFailureKind` distinguishes timeouts, overload, stopped clients, invalid params, oversized
+messages, protocol violations, transport failures, and typed encoding/decoding failures. Remote
+JSON-RPC errors have `kind = RpcFailureKind.REMOTE_ERROR`.
+
+Outgoing `params` must be a JSON object or array. Scalars and explicit null fail locally with
+`RpcFailureKind.INVALID_PARAMS`; wrap scalar arguments in an array or DTO.
 
 ```kotlin
 try {
@@ -100,8 +106,23 @@ scope.launch {
 }
 ```
 
-When the child exits, `ProcessRpcState.Unavailable` carries its exit code and its last lines of
-standard error.
+When the child exits, `ProcessRpcState.Unavailable` carries its exit code, failure kind, and its last
+lines of standard error.
+
+Collect `notificationEvents` to detect loss separately for each subscriber:
+
+```kotlin
+scope.launch {
+    client.notificationEvents.collect { event ->
+        if (event.droppedBefore > 0) refreshFromServer()
+        handleNotification(event.notification)
+    }
+}
+```
+
+Loss is reported on the next delivered notification after a collector falls behind. Messages emitted
+before collection began are excluded. `RpcNotification.sequenceNumber` increases across process
+restarts, so existing collectors retain continuity.
 
 ### Restarts, cancellation, and shutdown
 
@@ -130,18 +151,25 @@ cancels that scope itself.
 
 A call's timeout covers queueing, writing, and waiting for its response after the process becomes
 ready. Waiting for a starting process has a separate `callTimeoutMs` budget. Notifications and calls
-also have a `writeTimeoutMs` deadline, which defaults to 10 seconds. Cancelling or timing out a write
-that has started stops that process and fails its other calls, because a partial frame would corrupt
-the stream. Cancelling a queued message leaves the process running.
+also have a `writeTimeoutMs` deadline, which defaults to 10 seconds and includes body encoding.
+Cancelling a call, or letting its timeout expire, leaves the process running: a message that has
+started writing is always finished, and one still queued is skipped. Only a write that cannot finish
+within `writeTimeoutMs` stops the process, because the stream would then hold a partial frame.
 
 The constructor exposes these limits:
 
 | Option | Default | Behavior at the limit |
 | --- | --- | --- |
 | `maxPendingCalls` | 1,024 | Additional calls fail immediately. |
-| `maxQueuedWrites` | 256 | Additional sends fail immediately; a flood of child requests stops the process. |
+| `maxQueuedWrites` | 256 | Reserves capacity before body encoding; additional sends fail immediately. A flood of child requests stops the process. |
+| `maxQueuedWriteBytes` | 64 MiB | Caps encoded body bytes held by encoders, queued messages, and the active writer; excess sends fail locally with `OVERLOADED`. |
 | `maxMessageBytes` | 64 MiB | Oversized outgoing messages fail locally; oversized incoming frames stop the process. |
 | `maxStandardErrorLineBytes` | 8 KiB | The line is truncated, marked `[truncated]`, and drained through its next newline. |
+
+Body encoding runs on `Dispatchers.Default` and reserves bytes incrementally, stopping at the limit.
+The byte budget measures encoded body lengths; caller-owned JSON trees, encoder buffers, and
+transient buffer copies add memory overhead. Queued cancellations release their body and budget,
+and completed writes release capacity before resuming their callers.
 
 Each launch owns its pending calls and write queue. Closing or failing one launch cannot fail calls
 on a later launch. Abandonment hooks run sequentially per launch, with at most `maxQueuedWrites`
@@ -149,7 +177,8 @@ waiting hooks; excess hooks are dropped, and stopping that launch cancels its ho
 
 Incoming JSON-RPC envelopes are validated, including the version, IDs, and error fields. A response
 must contain exactly one of `result` or `error`; an explicit `"result": null` is valid. Invalid envelopes
-stop the process. Well-framed bodies that cannot be parsed as JSON are skipped.
+stop the process. Well-framed bodies that cannot be parsed as JSON are skipped. Child requests are
+rejected with `-32601`; requests inside a batch receive one response array, excluding notifications.
 
 ## Modules
 

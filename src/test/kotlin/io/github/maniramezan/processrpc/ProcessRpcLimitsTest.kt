@@ -24,6 +24,8 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -64,7 +66,7 @@ class ProcessRpcLimitsTest {
 			val client = server()
 			client.start()
 			val failure = withTimeout(5_000) {
-				assertFailsWith<ProcessRpcException> { client.call("respondWith", Json.parseToJsonElement(body)) }
+				assertFailsWith<ProcessRpcException> { client.call("respondWith", buildJsonObject { put("body", Json.parseToJsonElement(body)) }) }
 			}
 			assertTrue(failure.message.orEmpty().contains("Invalid JSON-RPC envelope"), body)
 			assertIs<ProcessRpcState.Unavailable>(client.state.value)
@@ -76,8 +78,8 @@ class ProcessRpcLimitsTest {
 		val client = server()
 		client.start()
 		val batch = Json.parseToJsonElement("""[{"jsonrpc":"2.0","id":999,"result":"unknown"},{"jsonrpc":"2.0","id":1,"result":null}]""")
-		assertEquals(JsonNull, client.call("respondWith", batch))
-		assertEquals(JsonPrimitive("healthy"), client.call("echo", JsonPrimitive("healthy")))
+		assertEquals(JsonNull, client.call("respondWith", buildJsonObject { put("body", batch) }))
+		assertEquals(buildJsonArray { add("healthy") }, client.call("echo", buildJsonArray { add("healthy") }))
 	}
 
 	@Test
@@ -85,7 +87,7 @@ class ProcessRpcLimitsTest {
 		val client = server()
 		client.start()
 		val batch = Json.parseToJsonElement("""[{"jsonrpc":"2.0","id":"1","result":"wrong"},{"jsonrpc":"2.0","id":1,"result":"right"}]""")
-		assertEquals(JsonPrimitive("right"), client.call("respondWith", batch))
+		assertEquals(JsonPrimitive("right"), client.call("respondWith", buildJsonObject { put("body", batch) }))
 	}
 
 	@Test
@@ -94,7 +96,7 @@ class ProcessRpcLimitsTest {
 		client.start()
 		val error = withTimeout(5_000) { client.call("askClientNull") }.jsonObject
 		assertEquals(-32601, error.getValue("code").jsonPrimitive.int)
-		assertEquals(JsonPrimitive("healthy"), client.call("echo", JsonPrimitive("healthy")))
+		assertEquals(buildJsonArray { add("healthy") }, client.call("echo", buildJsonArray { add("healthy") }))
 	}
 
 	@Test
@@ -105,7 +107,7 @@ class ProcessRpcLimitsTest {
 		client.call("echo")
 		assertFailsWith<ProcessRpcException> { client.call("slow", buildJsonObject { put("millis", 300) }, timeoutMs = 50) }
 		withTimeout(2_000) { abandoned.await() }
-		assertEquals(JsonPrimitive("next"), client.call("echo", JsonPrimitive("next")))
+		assertEquals(buildJsonArray { add("next") }, client.call("echo", buildJsonArray { add("next") }))
 	}
 
 	@Test
@@ -113,10 +115,12 @@ class ProcessRpcLimitsTest {
 		val client = server()
 		client.start()
 		client.call("echo")
-		val first = async(start = CoroutineStart.UNDISPATCHED) { client.call("outOfOrder", JsonPrimitive("first")) }
-		val second = async { client.call("echo", JsonPrimitive("second")) }
-		assertEquals(JsonPrimitive("second"), withTimeout(5_000) { second.await() })
-		assertEquals(JsonPrimitive("first"), first.await())
+		val awaitingSecond = async(start = CoroutineStart.UNDISPATCHED) { client.notifications.first { it.method == "awaitingSecond" } }
+		val first = async(start = CoroutineStart.UNDISPATCHED) { client.call("outOfOrder", buildJsonArray { add("first") }) }
+		withTimeout(5_000) { awaitingSecond.await() }
+		val second = async { client.call("echo", buildJsonArray { add("second") }) }
+		assertEquals(buildJsonArray { add("second") }, withTimeout(5_000) { second.await() })
+		assertEquals(buildJsonArray { add("first") }, first.await())
 	}
 
 	@Test
@@ -130,7 +134,7 @@ class ProcessRpcLimitsTest {
 		val failure = assertFailsWith<ProcessRpcException> { client.call("echo") }
 		assertTrue(failure.message.orEmpty().contains("pending call limit"))
 		assertTrue(first.await().isFailure)
-		assertEquals(JsonPrimitive("next"), client.call("echo", JsonPrimitive("next")))
+		assertEquals(buildJsonArray { add("next") }, client.call("echo", buildJsonArray { add("next") }))
 	}
 
 	@Test
@@ -140,7 +144,7 @@ class ProcessRpcLimitsTest {
 		client.call("pauseReading")
 		val pid = (client.state.value as ProcessRpcState.Ready).pid
 		val failure = withTimeout(2_000) {
-			assertFailsWith<ProcessRpcException> { client.notify("large", JsonPrimitive("x".repeat(2_000_000))) }
+			assertFailsWith<ProcessRpcException> { client.notify("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) }
 		}
 		assertTrue(failure.message.orEmpty().contains("write"))
 		eventually { !ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false) }
@@ -152,7 +156,7 @@ class ProcessRpcLimitsTest {
 		val client = server(maxMessageBytes = 64)
 		client.start()
 		client.call("echo")
-		val failure = assertFailsWith<ProcessRpcException> { client.notify("large", JsonPrimitive("x".repeat(100))) }
+		val failure = assertFailsWith<ProcessRpcException> { client.notify("large", buildJsonObject { put("payload", "x".repeat(100)) }) }
 		assertTrue(failure.message.orEmpty().contains("exceeds"))
 		assertIs<ProcessRpcState.Ready>(client.state.value)
 		client.call("echo")
@@ -163,10 +167,11 @@ class ProcessRpcLimitsTest {
 		val client = server(writeTimeoutMs = 10_000)
 		client.start()
 		client.call("pauseReading")
-		withTimeout(2_000) {
-			assertFailsWith<ProcessRpcException> { client.call("large", JsonPrimitive("x".repeat(2_000_000)), timeoutMs = 100) }
+		val error = withTimeout(2_000) {
+			assertFailsWith<ProcessRpcException> { client.call("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }, timeoutMs = 100) }
 		}
-		assertIs<ProcessRpcState.Unavailable>(client.state.value)
+		assertEquals(RpcFailureKind.TIMEOUT, error.kind)
+		assertIs<ProcessRpcState.Ready>(client.state.value)
 	}
 
 	@Test
@@ -175,7 +180,7 @@ class ProcessRpcLimitsTest {
 		client.start()
 		client.call("pauseReading")
 		val attempts = List(16) {
-			async(Dispatchers.IO) { runCatching { client.notify("large", JsonPrimitive("x".repeat(500_000))) } }
+			async(Dispatchers.IO) { runCatching { client.notify("large", buildJsonObject { put("payload", "x".repeat(500_000)) }) } }
 		}
 		try {
 			eventually { attempts.any { it.isCompleted } }
@@ -193,7 +198,7 @@ class ProcessRpcLimitsTest {
 		client.start()
 		client.call("echo")
 		val slow = async(start = CoroutineStart.UNDISPATCHED) { client.call("slow", buildJsonObject { put("millis", 1_000) }) }
-		val writing = async(start = CoroutineStart.UNDISPATCHED) { client.notify("large", JsonPrimitive("x".repeat(2_000_000))) }
+		val writing = async(start = CoroutineStart.UNDISPATCHED) { client.notify("large", buildJsonObject { put("payload", "x".repeat(2_000_000)) }) }
 		val queued = async(start = CoroutineStart.UNDISPATCHED) { client.notify("remember", buildJsonObject { put("cancelled", true) }) }
 		queued.cancelAndJoin()
 		withTimeout(5_000) { slow.await(); writing.await() }
@@ -217,7 +222,7 @@ class ProcessRpcLimitsTest {
 		val client = server(maxStandardErrorLineBytes = 8)
 		val lines = async(start = CoroutineStart.UNDISPATCHED) { client.standardError.take(3).toList() }
 		client.start()
-		client.call("stderr", JsonPrimitive("x".repeat(100_000) + "\r\nnext\rlast\n"))
+		client.call("stderr", buildJsonObject { put("text", "x".repeat(100_000) + "\r\nnext\rlast\n") })
 		assertEquals(listOf("xxxxxxxx [truncated]", "next", "last"), withTimeout(5_000) { lines.await() })
 	}
 

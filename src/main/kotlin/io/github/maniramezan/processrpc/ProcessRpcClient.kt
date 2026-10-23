@@ -21,6 +21,8 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -61,25 +63,33 @@ public sealed interface ProcessRpcState {
 	/**
 	 * The child failed to launch, exited, or broke the wire protocol. [reason] includes the last lines the
 	 * child wrote to standard error, and [exitCode] is set when the child exited and its code is known.
+	 * [kind] classifies the failure without parsing [reason].
 	 * Calls fail immediately until [ProcessRpcClient.start] is called again or the [RestartPolicy] restarts it.
 	 */
-	public data class Unavailable(val reason: String, val exitCode: Int? = null) : ProcessRpcState
+	public data class Unavailable(val reason: String, val exitCode: Int? = null, val kind: RpcFailureKind = RpcFailureKind.TRANSPORT) : ProcessRpcState
 }
 
 /**
  * A failed call or notification. [rpcCode] and [data] carry the JSON-RPC `error.code` and `error.data`
  * when the child answered with an error response; both are `null` for transport failures, such as a
- * timeout or a child that stopped.
+ * timeout or a child that stopped. [kind] distinguishes local failure categories without parsing messages.
  */
 public class ProcessRpcException(
 	public val rpcCode: Int?,
 	message: String,
 	cause: Throwable? = null,
 	public val data: JsonElement? = null,
+	public val kind: RpcFailureKind = if (rpcCode == null) RpcFailureKind.TRANSPORT else RpcFailureKind.REMOTE_ERROR,
 ) : Exception(message, cause)
 
-/** A JSON-RPC notification (a message with a `method` and no `id`) sent by the child process. */
-public data class RpcNotification(val method: String, val params: JsonElement)
+/**
+ * A JSON-RPC notification sent by the child. [sequenceNumber] increases across launches of this client,
+ * allowing collectors to detect gaps; manually constructed notifications default to zero.
+ */
+public data class RpcNotification(val method: String, val params: JsonElement, val sequenceNumber: Long = 0)
+
+/** A notification and the number of messages this collector missed immediately before it. */
+public data class RpcNotificationEvent(val notification: RpcNotification, val droppedBefore: Long)
 
 /** What a [ProcessRpcClient] does when its child exits or fails without [ProcessRpcClient.close] or [ProcessRpcClient.stop]. */
 public sealed interface RestartPolicy {
@@ -139,6 +149,7 @@ public sealed interface RestartPolicy {
  * @param writeTimeoutMs bounds queueing and writing any message, independently of a call's timeout.
  * @param maxPendingCalls maximum concurrent calls per launch; excess calls fail immediately.
  * @param maxQueuedWrites maximum messages waiting for the writer; excess sends fail immediately.
+ * @param maxQueuedWriteBytes maximum encoded body bytes retained by encoders, queued writes, and the active writer.
  * @param maxStandardErrorLineBytes maximum bytes retained from each stderr line; excess bytes are
  *   discarded until the next line, and the emitted prefix is marked `[truncated]`.
  * @param onCallAbandoned invoked when a [call] whose request was sent times out or its caller is
@@ -163,6 +174,7 @@ public class ProcessRpcClient(
 	private val maxQueuedWrites: Int = 256,
 	private val maxStandardErrorLineBytes: Int = 8_192,
 	private val onCallAbandoned: (suspend ProcessRpcClient.(requestId: Long, method: String) -> Unit)? = null,
+	private val maxQueuedWriteBytes: Long = 64L * 1024 * 1024,
 ) : AutoCloseable {
 	init {
 		require(callTimeoutMs > 0) { "callTimeoutMs must be positive" }
@@ -170,6 +182,7 @@ public class ProcessRpcClient(
 		require(writeTimeoutMs > 0) { "writeTimeoutMs must be positive" }
 		require(maxMessageBytes > 0) { "maxMessageBytes must be positive" }
 		require(maxPendingCalls > 0) { "maxPendingCalls must be positive" }
+		require(maxQueuedWriteBytes > 0) { "maxQueuedWriteBytes must be positive" }
 		require(maxQueuedWrites > 0) { "maxQueuedWrites must be positive" }
 		require(maxStandardErrorLineBytes > 0) { "maxStandardErrorLineBytes must be positive" }
 		require(notificationBufferCapacity > 0) { "notificationBufferCapacity must be positive" }
@@ -177,6 +190,7 @@ public class ProcessRpcClient(
 
 	private val json = Json { ignoreUnknownKeys = true }
 	private val ids = AtomicLong(1)
+	private val notificationSequence = AtomicLong()
 	private val lifecycleLock = Any()
 	private var generation = 0L
 	private var restarts = 0
@@ -191,6 +205,19 @@ public class ProcessRpcClient(
 
 	/** Notifications sent by the child process, in arrival order. Hot: subscribe before calling [start] to see every message. */
 	public val notifications: SharedFlow<RpcNotification> = mutableNotifications.asSharedFlow()
+
+	/**
+	 * Notifications with loss reported separately for each collector. A slow collector learns how many
+	 * messages it missed when it resumes. Messages from before collection began are excluded.
+	 */
+	public val notificationEvents: Flow<RpcNotificationEvent> = flow {
+		var previous = notificationSequence.get()
+		notifications.collect { notification ->
+			val dropped = (notification.sequenceNumber - previous - 1).coerceAtLeast(0)
+			previous = notification.sequenceNumber
+			emit(RpcNotificationEvent(notification, dropped))
+		}
+	}
 	private val mutableStandardError = MutableSharedFlow<String>(
 		extraBufferCapacity = STANDARD_ERROR_BUFFER_LINES,
 		onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -217,10 +244,13 @@ public class ProcessRpcClient(
 	 * this call, for operations known to take minutes, such as builds; it bounds queued writes and the
 	 * response wait after the process becomes ready.
 	 *
+	 * Params must be a JSON object or array. Other values fail locally with [RpcFailureKind.INVALID_PARAMS].
+	 *
 	 * @throws ProcessRpcException when the child answers with an error, the call times out, or the child
 	 *   is not running or stops before answering. Cancelling the caller cancels the call as usual.
 	 */
 	public suspend fun call(method: String, params: JsonElement = JsonObject(emptyMap()), timeoutMs: Long? = null): JsonElement {
+		validateParams(params)
 		val timeout = timeoutMs ?: callTimeoutMs
 		require(timeout > 0) { "timeoutMs must be positive" }
 		val current = awaitSession()
@@ -228,7 +258,7 @@ public class ProcessRpcClient(
 		val deferred = CompletableDeferred<JsonElement>()
 		synchronized(lifecycleLock) {
 			checkSession(current)
-			if (current.pending.size >= maxPendingCalls) throw ProcessRpcException(null, "RPC pending call limit of $maxPendingCalls reached")
+			if (current.pending.size >= maxPendingCalls) throw ProcessRpcException(null, "RPC pending call limit of $maxPendingCalls reached", kind = RpcFailureKind.OVERLOADED)
 			current.pending[id] = deferred
 		}
 		val sent = AtomicBoolean()
@@ -242,7 +272,7 @@ public class ProcessRpcClient(
 			return withTimeoutOrNull(timeout) {
 				write(current, request, sent)
 				deferred.await()
-			} ?: throw ProcessRpcException(null, "RPC call '$method' timed out after $timeout ms")
+			} ?: throw ProcessRpcException(null, "RPC call '$method' timed out after $timeout ms", kind = RpcFailureKind.TIMEOUT)
 		} catch (error: CancellationException) {
 			throw error
 		} catch (error: ProcessRpcException) {
@@ -257,11 +287,12 @@ public class ProcessRpcClient(
 	}
 
 	/**
-	 * Sends a JSON-RPC notification, which has no ID and receives no response.
+	 * Sends a JSON-RPC notification, which has no ID and receives no response. Params must be an object or array.
 	 *
 	 * @throws ProcessRpcException when the child is not running or the message cannot be written.
 	 */
 	public suspend fun notify(method: String, params: JsonElement = JsonObject(emptyMap())) {
+		validateParams(params)
 		val current = awaitSession()
 		val notification = buildJsonObject {
 			put("jsonrpc", "2.0")
@@ -271,6 +302,8 @@ public class ProcessRpcClient(
 		try {
 			write(current, notification)
 		} catch (error: CancellationException) {
+			throw error
+		} catch (error: ProcessRpcException) {
 			throw error
 		} catch (error: Exception) {
 			throw ProcessRpcException(null, "RPC notification '$method' failed: ${error.message}", error)
@@ -341,25 +374,25 @@ public class ProcessRpcClient(
 			mutableState.value = ProcessRpcState.Stopped
 			previous
 		}
-		current?.session?.finish("RPC process stopped")
+		current?.session?.finish("RPC process stopped", RpcFailureKind.NOT_RUNNING)
 		return current
 	}
 
 	private suspend fun awaitSession(): RpcSession {
 		val settled = withTimeoutOrNull(callTimeoutMs) { state.first { it !is ProcessRpcState.Starting } }
-			?: throw ProcessRpcException(null, "RPC process did not start within $callTimeoutMs ms")
+			?: throw ProcessRpcException(null, "RPC process did not start within $callTimeoutMs ms", kind = RpcFailureKind.TIMEOUT)
 		return synchronized(lifecycleLock) {
 			when (settled) {
 				is ProcessRpcState.Ready -> session?.takeIf { it.child.pid() == settled.pid }
-					?: throw ProcessRpcException(null, "RPC process stopped")
-				is ProcessRpcState.Unavailable -> throw ProcessRpcException(null, settled.reason)
-				else -> throw ProcessRpcException(null, "RPC process is not running; call start() first")
+					?: throw ProcessRpcException(null, "RPC process stopped", kind = RpcFailureKind.NOT_RUNNING)
+				is ProcessRpcState.Unavailable -> throw ProcessRpcException(null, settled.reason, kind = settled.kind)
+				else -> throw ProcessRpcException(null, "RPC process is not running; call start() first", kind = RpcFailureKind.NOT_RUNNING)
 			}
 		}
 	}
 
 	private fun checkSession(current: RpcSession) {
-		if (session !== current) throw ProcessRpcException(null, "RPC process stopped")
+		if (session !== current) throw ProcessRpcException(null, "RPC process stopped", kind = RpcFailureKind.NOT_RUNNING)
 	}
 
 	private suspend fun runProcess(launched: Long) {
@@ -379,7 +412,7 @@ public class ProcessRpcClient(
 			if (settle(launched, "Failed to start RPC process: ${error.message}", exitCode = null)) scheduleRestart(launched, uptimeMs = 0)
 			return
 		}
-		val current = RpcSession(launched, child, maxQueuedWrites, scope.coroutineContext)
+		val current = RpcSession(launched, child, maxQueuedWrites, maxQueuedWriteBytes, scope.coroutineContext)
 		val launchContext = currentCoroutineContext()
 		val attached = synchronized(lifecycleLock) {
 			if (generation == launched && launchContext.isActive) {
@@ -429,7 +462,12 @@ public class ProcessRpcClient(
 			}
 			val output = synchronized(tail) { tail.joinToString("\n") }
 			val reason = if (output.isEmpty()) summary else "$summary; last standard error output:\n$output"
-			if (settle(launched, reason, exitCode)) {
+			val kind = when (protocolError) {
+				null -> RpcFailureKind.TRANSPORT
+				is ProcessRpcException -> protocolError.kind
+				else -> RpcFailureKind.PROTOCOL
+			}
+			if (settle(launched, reason, exitCode, kind)) {
 				scheduleRestart(launched, uptimeMs = current.uptimeMs)
 			}
 		} finally {
@@ -438,23 +476,23 @@ public class ProcessRpcClient(
 		}
 	}
 
-	private fun settle(launched: Long, reason: String, exitCode: Int?): Boolean {
+	private fun settle(launched: Long, reason: String, exitCode: Int?, kind: RpcFailureKind = RpcFailureKind.TRANSPORT): Boolean {
 		val previous = synchronized(lifecycleLock) {
 			if (generation != launched || mutableState.value is ProcessRpcState.Stopped || mutableState.value is ProcessRpcState.Unavailable) return false
 			val current = session?.let { DetachedSession(it, ProcessShutdown.capture(it.child)) }
 			session = null
-			mutableState.value = ProcessRpcState.Unavailable(reason, exitCode)
+			mutableState.value = ProcessRpcState.Unavailable(reason, exitCode, kind)
 			current
 		}
 		if (previous != null) {
 			ProcessShutdown.terminate(previous.handles, shutdownTimeoutMs)
-			previous.session.finish(reason)
+			previous.session.finish(reason, kind)
 		}
 		return true
 	}
 
-	private fun failSession(current: RpcSession, reason: String, forcibly: Boolean = false, restart: Boolean = true) {
-		if (settle(current.generation, reason, exitCode = null)) {
+	private fun failSession(current: RpcSession, reason: String, forcibly: Boolean = false, restart: Boolean = true, kind: RpcFailureKind = RpcFailureKind.TRANSPORT) {
+		if (settle(current.generation, reason, exitCode = null, kind = kind)) {
 			if (forcibly) ProcessShutdown.terminate(current.child, shutdownTimeoutMs, forcibly = true)
 			if (restart) scheduleRestart(current.generation, uptimeMs = current.uptimeMs)
 		}
@@ -474,32 +512,52 @@ public class ProcessRpcClient(
 		}
 	}
 
-	private fun enqueue(current: RpcSession, message: JsonObject, sent: AtomicBoolean = AtomicBoolean()): RpcWrite {
-		val body = json.encodeToString(JsonObject.serializer(), message).encodeToByteArray()
-		if (body.size > maxMessageBytes) throw ProcessRpcException(null, "RPC message exceeds the $maxMessageBytes byte limit")
-		val outgoing = RpcWrite(body, sent)
-		synchronized(lifecycleLock) {
+	private suspend fun enqueue(current: RpcSession, message: JsonElement, sent: AtomicBoolean = AtomicBoolean()): RpcWrite {
+		val reservation = synchronized(lifecycleLock) {
 			checkSession(current)
-			if (!current.writes.trySend(outgoing).isSuccess) throw ProcessRpcException(null, "RPC write queue limit of $maxQueuedWrites reached")
+			current.writeBudget.reserve()
 		}
-		return outgoing
+		try {
+			val body = withTimeoutOrNull(writeTimeoutMs) {
+				withContext(Dispatchers.Default) {
+					encodeRpcMessage(json, message, maxMessageBytes, reservation, currentCoroutineContext())
+				}
+			} ?: throw ProcessRpcException(null, "RPC encoding timed out after $writeTimeoutMs ms", kind = RpcFailureKind.TIMEOUT)
+			val outgoing = RpcWrite(body, sent, reservation)
+			synchronized(lifecycleLock) {
+				checkSession(current)
+				if (!current.writes.trySend(outgoing).isSuccess) throw ProcessRpcException(null, "RPC write queue limit of $maxQueuedWrites reached", kind = RpcFailureKind.OVERLOADED)
+			}
+			return outgoing
+		} catch (error: Throwable) {
+			reservation.close()
+			throw error
+		}
 	}
 
 	private suspend fun write(current: RpcSession, message: JsonObject, sent: AtomicBoolean = AtomicBoolean()) {
-		val outgoing = enqueue(current, message, sent)
+		var outgoing: RpcWrite? = null
 		try {
 			withTimeoutOrNull(writeTimeoutMs) {
+				val queued = enqueue(current, message, sent)
+				outgoing = queued
 				select<Unit> {
-					outgoing.completed.onAwait { }
+					queued.completed.onAwait { }
 					current.closed.onAwait { }
 				}
-			} ?: throw ProcessRpcException(null, "RPC write timed out after $writeTimeoutMs ms")
+			} ?: throw ProcessRpcException(null, "RPC write timed out after $writeTimeoutMs ms", kind = RpcFailureKind.TIMEOUT)
 		} finally {
-			val partial = synchronized(outgoing) {
-				outgoing.abandoned = true
-				outgoing.started && !outgoing.completed.isCompleted
+			// A write the writer has started is left to finish: the writer, not this caller, owns the frame,
+			// and its own deadline stops the process if the frame can never be completed.
+			outgoing?.let { queued ->
+				synchronized(queued) {
+					queued.abandoned = true
+					if (!queued.started) {
+						queued.body = ByteArray(0)
+						queued.reservation.close()
+					}
+				}
 			}
-			if (partial) failSession(current, "RPC write was interrupted; the stream may contain a partial frame", forcibly = true)
 		}
 	}
 
@@ -507,28 +565,35 @@ public class ProcessRpcClient(
 		current.scope.launch {
 			try {
 				for (outgoing in current.writes) {
-					val abandoned = synchronized(outgoing) {
-						if (!outgoing.abandoned) outgoing.started = true
-						outgoing.abandoned
-					}
-					if (abandoned) continue
-					val remainingMs = writeTimeoutMs - (System.nanoTime() - outgoing.queuedAtNanos) / 1_000_000
-					if (remainingMs <= 0) {
-						failSession(current, "RPC write timed out in the queue after $writeTimeoutMs ms")
-						break
-					}
-					val deadline = ProcessShutdown.schedule(remainingMs) {
-						if (!outgoing.completed.isCompleted) {
-							ProcessShutdown.terminate(current.child, shutdownTimeoutMs, forcibly = true)
-							cleanupScope.launch { failSession(current, "RPC write timed out after $writeTimeoutMs ms", forcibly = true) }
-						}
-					}
+					outgoing.reservation.releaseSlot()
 					try {
-						ContentLengthFraming.writeMessage(outgoing.body, current.child.outputStream)
-						outgoing.sent.set(true)
-						outgoing.completed.complete(Unit)
+						val abandoned = synchronized(outgoing) {
+							if (!outgoing.abandoned) outgoing.started = true
+							outgoing.abandoned
+						}
+						if (abandoned) continue
+						val remainingMs = writeTimeoutMs - (System.nanoTime() - outgoing.reservation.queuedAtNanos) / 1_000_000
+						if (remainingMs <= 0) {
+							failSession(current, "RPC write timed out in the queue after $writeTimeoutMs ms", kind = RpcFailureKind.TIMEOUT)
+							break
+						}
+						val deadline = ProcessShutdown.schedule(remainingMs) {
+							if (!outgoing.completed.isCompleted) {
+								ProcessShutdown.terminate(current.child, shutdownTimeoutMs, forcibly = true)
+								cleanupScope.launch { failSession(current, "RPC write timed out after $writeTimeoutMs ms", forcibly = true, kind = RpcFailureKind.TIMEOUT) }
+							}
+						}
+						try {
+							ContentLengthFraming.writeMessage(outgoing.body, current.child.outputStream)
+							outgoing.sent.set(true)
+							outgoing.body = ByteArray(0)
+							outgoing.reservation.close()
+							outgoing.completed.complete(Unit)
+						} finally {
+							deadline.close()
+						}
 					} finally {
-						deadline.close()
+						outgoing.reservation.close()
 					}
 				}
 			} catch (error: Exception) {
@@ -542,7 +607,7 @@ public class ProcessRpcClient(
 		}
 	}
 
-	private fun readMessages(current: RpcSession, input: BufferedInputStream) {
+	private suspend fun readMessages(current: RpcSession, input: BufferedInputStream) {
 		while (true) {
 			val bytes = ContentLengthFraming.readMessage(input, maxMessageBytes) ?: return
 			val message = try {
@@ -551,18 +616,19 @@ public class ProcessRpcClient(
 				continue
 			}
 			when (message) {
-				is JsonObject -> dispatch(current, message)
+				is JsonObject -> dispatch(current, message)?.let { enqueue(current, it) }
 				is JsonArray -> {
 					if (message.isEmpty()) protocolError("empty batch")
-					message.forEach { dispatch(current, it as? JsonObject ?: protocolError("batch element is not an object")) }
+					val rejections = message.mapNotNull { dispatch(current, it as? JsonObject ?: protocolError("batch element is not an object")) }
+					if (rejections.isNotEmpty()) enqueue(current, JsonArray(rejections))
 				}
 				else -> protocolError("message is not an object or batch")
 			}
 		}
 	}
 
-	private fun dispatch(current: RpcSession, message: JsonObject) {
-		if (synchronized(lifecycleLock) { session !== current }) return
+	private fun dispatch(current: RpcSession, message: JsonObject): JsonObject? {
+		if (synchronized(lifecycleLock) { session !== current }) return null
 		if (message["jsonrpc"] != JsonPrimitive("2.0")) protocolError("jsonrpc must be the string 2.0")
 		val idElement = message["id"]
 		if (idElement != null && idElement !is JsonNull && (idElement !is JsonPrimitive || (!idElement.isString && idElement.doubleOrNull?.isFinite() != true))) {
@@ -573,31 +639,35 @@ public class ProcessRpcClient(
 			if ("result" in message || "error" in message) protocolError("request contains response fields")
 			val params = message["params"]
 			if (params != null && params !is JsonObject && params !is JsonArray) protocolError("params must be an object or array")
-			if (idElement == null) mutableNotifications.tryEmit(RpcNotification(method, params ?: JsonNull))
-			else rejectServerRequest(current, idElement, method)
-			return
+			if (idElement != null) return rejectServerRequest(idElement, method)
+			mutableNotifications.tryEmit(RpcNotification(method, params ?: JsonNull, notificationSequence.incrementAndGet()))
+			return null
 		}
 		if (idElement == null) protocolError("response has no id")
 		if (("result" in message) == ("error" in message)) protocolError("response must have exactly one of result or error")
 		val error = if ("error" in message) message["error"] as? JsonObject ?: protocolError("error must be an object") else null
 		val code = error?.let { (it["code"] as? JsonPrimitive)?.takeUnless { value -> value.isString }?.intOrNull ?: protocolError("error.code must be an integer") }
 		val text = error?.let { (it["message"] as? JsonPrimitive)?.takeIf { value -> value.isString }?.content ?: protocolError("error.message must be a string") }
-		val id = idElement.takeUnless { it.isString }?.longOrNull ?: return
-		val deferred = current.pending[id] ?: return
+		val id = idElement.takeUnless { it.isString }?.longOrNull ?: return null
+		val deferred = current.pending[id] ?: return null
 		if (error != null) deferred.completeExceptionally(ProcessRpcException(code, text!!, data = error["data"]))
 		else deferred.complete(message.getValue("result"))
+		return null
 	}
 
-	private fun rejectServerRequest(current: RpcSession, id: JsonElement, method: String) {
-		val response = buildJsonObject {
-			put("jsonrpc", "2.0")
-			put("id", id)
-			put("error", buildJsonObject {
-				put("code", -32601)
-				put("message", "Client does not handle method '$method'")
-			})
+	private fun rejectServerRequest(id: JsonElement, method: String): JsonObject = buildJsonObject {
+		put("jsonrpc", "2.0")
+		put("id", id)
+		put("error", buildJsonObject {
+			put("code", -32601)
+			put("message", "Client does not handle method '$method'")
+		})
+	}
+
+	private fun validateParams(params: JsonElement) {
+		if (params !is JsonObject && params !is JsonArray) {
+			throw ProcessRpcException(null, "RPC params must be an object or array", kind = RpcFailureKind.INVALID_PARAMS)
 		}
-		enqueue(current, response)
 	}
 
 	private fun protocolError(detail: String): Nothing = throw java.io.IOException("Invalid JSON-RPC envelope: $detail")

@@ -1,0 +1,40 @@
+name: JitPack consumer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: JitPack version, tag, or commit to verify
+        required: true
+        type: string
+  push:
+    tags: ["0.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        id: java17
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-java@v6
+        id: java21
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Resolve and run the published consumer
+        env:
+          RPC_VERSION: ${{ inputs.version || github.ref_name }}
+          JAVA17_HOME: ${{ steps.java17.outputs.path }}
+          JAVA21_HOME: ${{ steps.java21.outputs.path }}
+        run: |
+          mkdir -p build
+          curl --fail --location --retry 20 --retry-all-errors --retry-delay 15 --retry-max-time 900 --max-time 60 --output build/jitpack.pom "https://jitpack.io/com/github/maniramezan/process-rpc-kotlin/${RPC_VERSION}/process-rpc-kotlin-${RPC_VERSION}.pom"
+          ./gradlew -p integration/consumer run -PrpcRepository=https://jitpack.io "-PrpcCoordinates=com.github.maniramezan:process-rpc-kotlin:${RPC_VERSION}" -PtestJavaVersion=17 "-Porg.gradle.java.installations.paths=${JAVA17_HOME},${JAVA21_HOME}" --refresh-dependencies
