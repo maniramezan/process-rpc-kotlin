@@ -1,5 +1,7 @@
 package io.github.maniramezan.processrpc
 
+import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
@@ -12,6 +14,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
@@ -20,6 +23,11 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
@@ -131,6 +139,7 @@ class ProcessRpcClientTest {
 
 		assertEquals(-32000, error.rpcCode)
 		assertEquals("failed on purpose", error.message)
+		assertEquals("scripted", error.data?.jsonObject?.getValue("detail")?.jsonPrimitive?.content)
 	}
 
 	@Test
@@ -298,6 +307,133 @@ class ProcessRpcClientTest {
 		eventually { !isAlive(pid) }
 	}
 
+	@Test
+	fun `standard error is published and explains an exit`() = runBlocking<Unit> {
+		val client = fakeServer()
+		val lines = scope.async { client.standardError.take(2).toList() }
+		yield()
+		client.start()
+
+		assertFailsWith<ProcessRpcException> { client.call("crash") }
+
+		assertEquals(listOf("first problem", "fatal: scripted crash"), withTimeout(5_000) { lines.await() })
+		val unavailable = assertIs<ProcessRpcState.Unavailable>(client.state.value)
+		assertEquals(3, unavailable.exitCode)
+		assertTrue(unavailable.reason.contains("exited with code 3"))
+		assertTrue(unavailable.reason.contains("fatal: scripted crash"))
+	}
+
+	@Test
+	fun `typed calls encode params and decode results`() = runBlocking<Unit> {
+		val client = fakeServer()
+		val tick = scope.async { client.notifications.first().paramsAs<Tick>() }
+		yield()
+		client.start()
+
+		val echoed = client.callAs<Greeting, Greeting>("echo", Greeting("Ada"))
+		client.notifyWith("remember", Greeting("Grace"))
+		val recalled = client.callAs<Greeting>("recall")
+		client.call("emit", buildJsonObject { put("count", 1) })
+
+		assertEquals(Greeting("Ada"), echoed)
+		assertEquals(Greeting("Grace"), recalled)
+		assertEquals(Tick(0), withTimeout(5_000) { tick.await() })
+	}
+
+	@Test
+	fun `a result that does not decode is an RPC failure`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+
+		val error = assertFailsWith<ProcessRpcException> { client.callAs<Greeting>("echo", buildJsonObject { put("other", 1) }) }
+
+		assertTrue(error.message.orEmpty().contains("decode"))
+	}
+
+	@Test
+	fun `the child runs in the given directory and environment`() = runBlocking<Unit> {
+		val directory = Files.createTempDirectory("process-rpc").toFile()
+		cleanups += { directory.deleteRecursively() }
+		val systemRoot = System.getenv("SystemRoot")?.let { mapOf("SystemRoot" to it) }.orEmpty()
+		val client = fakeServer(workingDirectory = directory, inheritEnvironment = false, environment = mapOf("ONLY" to "1") + systemRoot)
+		client.start()
+
+		val cwd = client.call("cwd").jsonPrimitive.content
+		val env = client.call("env", buildJsonObject { put("names", buildJsonArray { add("ONLY"); add("PATH") }) }).jsonObject
+
+		assertEquals(directory.canonicalPath, File(cwd).canonicalPath)
+		assertEquals("1", env.getValue("ONLY").jsonPrimitive.content)
+		assertEquals(JsonNull, env.getValue("PATH"))
+	}
+
+	@Test
+	fun `the restart policy relaunches a child that exits`() = runBlocking<Unit> {
+		val client = fakeServer(restartPolicy = RestartPolicy.Backoff(initialDelayMs = 100))
+		client.start()
+		val first = readyPid(client)
+
+		assertFailsWith<ProcessRpcException> { client.call("exit") }
+		eventually { (client.state.value as? ProcessRpcState.Ready)?.pid.let { it != null && it != first } }
+
+		assertEquals("hi", client.call("echo", JsonPrimitive("hi")).jsonPrimitive.content)
+	}
+
+	@Test
+	fun `the restart policy gives up after its limit`() = runBlocking<Unit> {
+		val launches = AtomicInteger()
+		val client = ProcessRpcClient(
+			command = { launches.incrementAndGet(); listOf("/nonexistent/process-rpc-test") },
+			scope = scope,
+			restartPolicy = RestartPolicy.Backoff(maxRestarts = 2, initialDelayMs = 50),
+		).also(clients::add)
+		client.start()
+
+		eventually { launches.get() == 3 }
+		delay(500)
+
+		assertEquals(3, launches.get())
+		assertIs<ProcessRpcState.Unavailable>(client.state.value)
+	}
+
+	@Test
+	fun `closing cancels a pending restart`() = runBlocking<Unit> {
+		val client = fakeServer(restartPolicy = RestartPolicy.Backoff(initialDelayMs = 300))
+		client.start()
+		assertFailsWith<ProcessRpcException> { client.call("exit") }
+
+		client.close()
+		delay(800)
+
+		assertEquals(ProcessRpcState.Stopped, client.state.value)
+	}
+
+	@Test
+	fun `an abandoned call is reported so the child can be told`() = runBlocking<Unit> {
+		val abandoned = CompletableDeferred<Pair<Long, String>>()
+		val client = fakeServer(onCallAbandoned = { id, method -> abandoned.complete(id to method) })
+		client.start()
+
+		assertFailsWith<ProcessRpcException> { client.call("slow", buildJsonObject { put("millis", 2_000) }, timeoutMs = 200) }
+
+		assertEquals("slow", withTimeout(5_000) { abandoned.await() }.second)
+	}
+
+	@Test
+	fun `a message over the size limit is a protocol error`() = runBlocking<Unit> {
+		val client = fakeServer(maxMessageBytes = 64)
+		client.start()
+
+		val error = assertFailsWith<ProcessRpcException> { client.call("echo", JsonPrimitive("x".repeat(100))) }
+
+		assertTrue(error.message.orEmpty().contains("exceeds"))
+	}
+
+	@Serializable
+	private data class Greeting(val name: String)
+
+	@Serializable
+	private data class Tick(val index: Int)
+
 	private suspend fun readyPid(client: ProcessRpcClient): Long {
 		client.call("echo")
 		return (client.state.value as ProcessRpcState.Ready).pid
@@ -321,6 +457,12 @@ class ProcessRpcClientTest {
 		shutdownTimeoutMs: Long = 2_000,
 		scope: CoroutineScope = this.scope,
 		onLaunch: () -> Unit = {},
+		workingDirectory: File? = null,
+		inheritEnvironment: Boolean = true,
+		environment: Map<String, String> = emptyMap(),
+		restartPolicy: RestartPolicy = RestartPolicy.Never,
+		maxMessageBytes: Int = ContentLengthFraming.DEFAULT_MAX_MESSAGE_BYTES,
+		onCallAbandoned: (suspend ProcessRpcClient.(Long, String) -> Unit)? = null,
 	): ProcessRpcClient {
 		val java = ProcessHandle.current().info().command().orElse("java")
 		val classPath = System.getProperty("java.class.path")
@@ -333,6 +475,12 @@ class ProcessRpcClientTest {
 			callTimeoutMs = callTimeoutMs,
 			notificationBufferCapacity = notificationBufferCapacity,
 			shutdownTimeoutMs = shutdownTimeoutMs,
+			workingDirectory = workingDirectory,
+			inheritEnvironment = inheritEnvironment,
+			environment = environment,
+			restartPolicy = restartPolicy,
+			maxMessageBytes = maxMessageBytes,
+			onCallAbandoned = onCallAbandoned,
 		).also(clients::add)
 	}
 }

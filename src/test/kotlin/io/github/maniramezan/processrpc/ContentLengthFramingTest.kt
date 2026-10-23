@@ -8,6 +8,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ContentLengthFramingTest {
 	@Test
@@ -30,7 +31,29 @@ class ContentLengthFramingTest {
 
 	@Test
 	fun `a header without Content-Length is rejected`() {
-		assertFailsWith<IllegalStateException> { ContentLengthFraming.readMessage(stream("Content-Type: x\r\n\r\n{}")) }
+		assertFailsWith<FramingException> { ContentLengthFraming.readMessage(stream("Content-Type: x\r\n\r\n{}")) }
+	}
+
+	@Test
+	fun `an invalid Content-Length is rejected`() {
+		assertFailsWith<FramingException> { ContentLengthFraming.readMessage(stream("Content-Length: lots\r\n\r\n{}")) }
+		assertFailsWith<FramingException> { ContentLengthFraming.readMessage(stream("Content-Length: -1\r\n\r\n{}")) }
+	}
+
+	@Test
+	fun `a body over the limit is rejected before it is read`() {
+		val error = assertFailsWith<FramingException> {
+			ContentLengthFraming.readMessage(stream("Content-Length: 2000000000\r\n\r\n"), maxMessageBytes = 1_024)
+		}
+
+		assertTrue(error.message.orEmpty().contains("exceeds"))
+	}
+
+	@Test
+	fun `a header without an end is rejected once it passes the limit`() {
+		val garbage = "x".repeat(ContentLengthFraming.MAX_HEADER_BYTES + 1)
+
+		assertFailsWith<FramingException> { ContentLengthFraming.readMessage(stream(garbage)) }
 	}
 
 	@Test

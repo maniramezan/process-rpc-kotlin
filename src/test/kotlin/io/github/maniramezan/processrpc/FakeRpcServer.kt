@@ -9,6 +9,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -71,6 +72,18 @@ fun main(args: Array<String>) {
 				respond(id, buildJsonObject { put("ignoring", true) })
 				Thread.sleep(60_000)
 			}
+			"crash" -> {
+				System.err.println("first problem")
+				System.err.println("fatal: scripted crash")
+				System.err.flush()
+				exitProcess(3)
+			}
+			"cwd" -> respond(id, JsonPrimitive(System.getProperty("user.dir")))
+			"env" -> respond(id, buildJsonObject {
+				params.jsonObject.getValue("names").jsonArray.forEach { name ->
+					put(name.jsonPrimitive.content, System.getenv(name.jsonPrimitive.content))
+				}
+			})
 			"exit" -> exitProcess(0)
 		}
 	}
