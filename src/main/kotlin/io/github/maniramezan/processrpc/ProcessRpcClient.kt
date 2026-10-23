@@ -1,8 +1,11 @@
 package io.github.maniramezan.processrpc
 
 import java.io.BufferedInputStream
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,18 +18,21 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 
 public sealed interface ProcessRpcState {
@@ -59,11 +65,14 @@ public class ProcessRpcClient(
 	private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 	private val callTimeoutMs: Long = 30_000,
 	notificationBufferCapacity: Int = 1_024,
+	private val shutdownTimeoutMs: Long = 2_000,
 ) : AutoCloseable {
 	private val json = Json { ignoreUnknownKeys = true }
 	private val ids = AtomicLong(1)
 	private val pending = ConcurrentHashMap<Long, CompletableDeferred<JsonElement>>()
 	private val writeLock = Mutex()
+	private val lifecycleLock = Any()
+	private var generation = 0L
 	private val mutableState = MutableStateFlow<ProcessRpcState>(ProcessRpcState.Stopped)
 	public val state: StateFlow<ProcessRpcState> = mutableState.asStateFlow()
 	private val mutableNotifications = MutableSharedFlow<RpcNotification>(
@@ -78,9 +87,15 @@ public class ProcessRpcClient(
 	private var process: Process? = null
 
 	public fun start() {
-		if (process?.isAlive == true || mutableState.value == ProcessRpcState.Starting) return
-		mutableState.value = ProcessRpcState.Starting
-		scope.launch { runProcess() }
+		val launched = synchronized(lifecycleLock) {
+			val current = mutableState.value
+			if (current is ProcessRpcState.Starting || current is ProcessRpcState.Ready) return
+			mutableState.value = ProcessRpcState.Starting
+			++generation
+		}
+		scope.launch(Dispatchers.IO) { runProcess(launched) }.invokeOnCompletion { cause ->
+			if (cause != null) settle(launched, "RPC process launch was cancelled")
+		}
 	}
 
 	/**
@@ -100,8 +115,13 @@ public class ProcessRpcClient(
 			put("params", params)
 		}
 		try {
+			if (process !== current) throw ProcessRpcException(null, "RPC process stopped")
 			write(current, request)
-			return withTimeout(timeoutMs ?: callTimeoutMs) { deferred.await() }
+			val timeout = timeoutMs ?: callTimeoutMs
+			return withTimeoutOrNull(timeout) { deferred.await() }
+				?: throw ProcessRpcException(null, "RPC call '$method' timed out after $timeout ms")
+		} catch (error: CancellationException) {
+			throw error
 		} catch (error: ProcessRpcException) {
 			throw error
 		} catch (error: Exception) {
@@ -121,80 +141,169 @@ public class ProcessRpcClient(
 		}
 		try {
 			write(current, notification)
+		} catch (error: CancellationException) {
+			throw error
 		} catch (error: Exception) {
 			throw ProcessRpcException(null, "RPC notification '$method' failed: ${error.message}", error)
 		}
 	}
 
+	/**
+	 * Stops the child without waiting: fails outstanding calls, signals the child and its descendants to
+	 * terminate, and forcibly kills any that are still alive after `shutdownTimeoutMs`.
+	 */
 	override fun close() {
-		process?.destroy()
-		process = null
-		mutableState.value = ProcessRpcState.Stopped
-		failPending("RPC process stopped")
+		val child = detach() ?: return
+		if (writeLock.tryLock()) {
+			try {
+				runCatching { child.outputStream.close() }
+			} finally {
+				writeLock.unlock()
+			}
+		}
+		terminate(child)
 	}
+
+	/**
+	 * Stops the child gracefully and waits for it to exit: closes its standard input, gives it
+	 * `shutdownTimeoutMs` to exit, then signals it to terminate, and finally kills it and its
+	 * descendants forcibly.
+	 */
+	public suspend fun stop() {
+		val child = detach() ?: return
+		withContext(Dispatchers.IO) {
+			val descendants = child.descendants().toList()
+			withTimeoutOrNull(shutdownTimeoutMs) {
+				writeLock.withLock { runCatching { child.outputStream.close() } }
+				child.onExit().await()
+			}
+			if (child.isAlive) child.destroy()
+			descendants.forEach(ProcessHandle::destroy)
+			withTimeoutOrNull(shutdownTimeoutMs) { exits(child.toHandle(), descendants).await() }
+			if (child.isAlive) child.destroyForcibly()
+			descendants.filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly)
+		}
+	}
+
+	private fun detach(): Process? {
+		val child = synchronized(lifecycleLock) {
+			generation++
+			mutableState.value = ProcessRpcState.Stopped
+			process.also { process = null }
+		}
+		failPending("RPC process stopped")
+		return child
+	}
+
+	private fun terminate(child: Process) {
+		val descendants = child.descendants().toList()
+		child.destroy()
+		descendants.forEach(ProcessHandle::destroy)
+		exits(child.toHandle(), descendants)
+			.completeOnTimeout(null, shutdownTimeoutMs, TimeUnit.MILLISECONDS)
+			.thenRun { (descendants + child.toHandle()).filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly) }
+	}
+
+	private fun exits(child: ProcessHandle, descendants: List<ProcessHandle>): CompletableFuture<Void?> =
+		CompletableFuture.allOf(*(descendants + child).map(ProcessHandle::onExit).toTypedArray())
 
 	private suspend fun awaitProcess(): Process {
-		val settled = withTimeout(callTimeoutMs) {
-			state.first { it is ProcessRpcState.Ready || it is ProcessRpcState.Unavailable }
+		val settled = withTimeoutOrNull(callTimeoutMs) { state.first { it !is ProcessRpcState.Starting } }
+			?: throw ProcessRpcException(null, "RPC process did not start within $callTimeoutMs ms")
+		return when (settled) {
+			is ProcessRpcState.Ready -> process ?: throw ProcessRpcException(null, "RPC process is not running")
+			is ProcessRpcState.Unavailable -> throw ProcessRpcException(null, settled.reason)
+			else -> throw ProcessRpcException(null, "RPC process is not running; call start() first")
 		}
-		if (settled is ProcessRpcState.Unavailable) throw ProcessRpcException(null, settled.reason)
-		return process ?: throw ProcessRpcException(null, "RPC process is not running")
 	}
 
-	private fun runProcess() {
-		try {
+	private fun runProcess(launched: Long) {
+		val child = try {
 			val invocation = command()
 			require(invocation.isNotEmpty()) { "Process command must not be empty" }
-			val child = ProcessBuilder(invocation).redirectErrorStream(false).apply {
+			ProcessBuilder(invocation).redirectErrorStream(false).apply {
 				environment().putAll(this@ProcessRpcClient.environment)
 			}.start()
-			process = child
-			mutableState.value = ProcessRpcState.Ready(child.pid())
-			scope.launch { child.errorStream.bufferedReader().useLines { lines -> lines.forEach { } } }
-			readResponses(child, BufferedInputStream(child.inputStream))
-			if (process === child) {
-				process = null
-				mutableState.value = ProcessRpcState.Unavailable("RPC process exited unexpectedly")
-				failPending("RPC process exited unexpectedly")
-			}
 		} catch (error: Exception) {
-			process = null
-			val reason = "Failed to start RPC process: ${error.message}"
-			mutableState.value = ProcessRpcState.Unavailable(reason)
-			failPending(reason)
+			settle(launched, "Failed to start RPC process: ${error.message}")
+			return
 		}
+		val attached = synchronized(lifecycleLock) {
+			if (generation == launched) {
+				process = child
+				mutableState.value = ProcessRpcState.Ready(child.pid())
+			}
+			generation == launched
+		}
+		if (!attached) {
+			terminate(child)
+			return
+		}
+		scope.launch(Dispatchers.IO) { child.errorStream.bufferedReader().useLines { lines -> lines.forEach { } } }
+		val reason = try {
+			readMessages(child, BufferedInputStream(child.inputStream))
+			"RPC process exited unexpectedly"
+		} catch (error: Exception) {
+			"RPC protocol error: ${error.message}"
+		}
+		if (settle(launched, reason)) terminate(child)
+	}
+
+	// Marks the client unavailable unless a newer start() or a close() has already replaced this run.
+	private fun settle(launched: Long, reason: String): Boolean {
+		synchronized(lifecycleLock) {
+			if (generation != launched) return false
+			process = null
+			mutableState.value = ProcessRpcState.Unavailable(reason)
+		}
+		failPending(reason)
+		return true
 	}
 
 	private suspend fun write(process: Process, message: JsonObject) {
+		val body = json.encodeToString(JsonObject.serializer(), message).encodeToByteArray()
 		writeLock.withLock {
-			ContentLengthFraming.writeMessage(json.encodeToString(JsonObject.serializer(), message).encodeToByteArray(), process.outputStream)
+			withContext(Dispatchers.IO) { ContentLengthFraming.writeMessage(body, process.outputStream) }
 		}
 	}
 
-	private fun readResponses(child: Process, input: BufferedInputStream) {
+	// Framing errors desynchronize the stream and propagate; a well-framed body that is not valid JSON is skipped.
+	private fun readMessages(child: Process, input: BufferedInputStream) {
 		while (true) {
 			val bytes = ContentLengthFraming.readMessage(input) ?: return
-			val message = json.parseToJsonElement(bytes.decodeToString()).jsonObject
-			val method = (message["method"] as? JsonPrimitive)?.contentOrNull
-			val idElement = message["id"]
-			if (method != null) {
-				if (idElement == null || idElement is JsonNull) {
-					mutableNotifications.tryEmit(RpcNotification(method, message["params"] ?: JsonNull))
-				} else {
-					rejectServerRequest(child, idElement, method)
-				}
+			val message = try {
+				json.parseToJsonElement(bytes.decodeToString())
+			} catch (error: SerializationException) {
 				continue
 			}
-			val id = (idElement as? JsonPrimitive)?.contentOrNull?.toLongOrNull() ?: continue
-			val deferred = pending[id] ?: continue
-			val error = message["error"]?.jsonObject
-			if (error != null) {
-				val code = (error["code"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
-				val message = (error["message"] as? JsonPrimitive)?.contentOrNull ?: "RPC error"
-				deferred.completeExceptionally(ProcessRpcException(code, message))
-			} else {
-				deferred.complete(message["result"] ?: JsonNull)
+			when (message) {
+				is JsonObject -> dispatch(child, message)
+				is JsonArray -> message.filterIsInstance<JsonObject>().forEach { dispatch(child, it) }
+				else -> Unit
 			}
+		}
+	}
+
+	private fun dispatch(child: Process, message: JsonObject) {
+		val method = (message["method"] as? JsonPrimitive)?.contentOrNull
+		val idElement = message["id"]
+		if (method != null) {
+			if (idElement == null || idElement is JsonNull) {
+				mutableNotifications.tryEmit(RpcNotification(method, message["params"] ?: JsonNull))
+			} else {
+				rejectServerRequest(child, idElement, method)
+			}
+			return
+		}
+		val id = (idElement as? JsonPrimitive)?.contentOrNull?.toLongOrNull() ?: return
+		val deferred = pending[id] ?: return
+		val error = message["error"] as? JsonObject
+		if (error != null) {
+			val code = (error["code"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
+			val text = (error["message"] as? JsonPrimitive)?.contentOrNull ?: "RPC error"
+			deferred.completeExceptionally(ProcessRpcException(code, text))
+		} else {
+			deferred.complete(message["result"] ?: JsonNull)
 		}
 	}
 
@@ -208,11 +317,10 @@ public class ProcessRpcClient(
 				put("message", "Client does not handle method '$method'")
 			})
 		}
-		scope.launch { runCatching { write(child, response) } }
+		scope.launch(Dispatchers.IO) { runCatching { write(child, response) } }
 	}
 
 	private fun failPending(reason: String) {
-		pending.values.forEach { it.completeExceptionally(ProcessRpcException(null, reason)) }
-		pending.clear()
+		pending.keys.forEach { id -> pending.remove(id)?.completeExceptionally(ProcessRpcException(null, reason)) }
 	}
 }

@@ -1,35 +1,48 @@
 package io.github.maniramezan.processrpc
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ProcessRpcClientTest {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 	private val clients = mutableListOf<ProcessRpcClient>()
+	private val cleanups = mutableListOf<() -> Unit>()
 
 	@AfterTest
 	fun tearDown() {
 		clients.forEach(ProcessRpcClient::close)
+		cleanups.forEach { it() }
 		scope.cancel()
 	}
 
@@ -109,14 +122,217 @@ class ProcessRpcClientTest {
 		assertTrue(error.message.orEmpty().contains("slow"))
 	}
 
-	private fun fakeServer(notificationBufferCapacity: Int = 1_024, callTimeoutMs: Long = 10_000): ProcessRpcClient {
+	@Test
+	fun `error responses carry the RPC code`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+
+		val error = assertFailsWith<ProcessRpcException> { client.call("fail") }
+
+		assertEquals(-32000, error.rpcCode)
+		assertEquals("failed on purpose", error.message)
+	}
+
+	@Test
+	fun `calling before start fails fast`() = runBlocking<Unit> {
+		val client = fakeServer(callTimeoutMs = 10_000)
+
+		val error = withTimeout(2_000) { assertFailsWith<ProcessRpcException> { client.call("echo") } }
+
+		assertTrue(error.message.orEmpty().contains("start()"))
+	}
+
+	@Test
+	fun `cancelling the caller propagates cancellation instead of an RPC error`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+		client.call("echo")
+		val thrown = CompletableDeferred<Throwable>()
+		val job = scope.launch {
+			try {
+				client.call("slow", buildJsonObject { put("millis", 5_000) })
+			} catch (error: Throwable) {
+				thrown.complete(error)
+				throw error
+			}
+		}
+		delay(300)
+
+		job.cancel()
+
+		assertIs<CancellationException>(withTimeout(5_000) { thrown.await() })
+	}
+
+	@Test
+	fun `an outer timeout is not reported as an RPC failure`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+
+		val result = withTimeoutOrNull(300) { client.call("slow", buildJsonObject { put("millis", 5_000) }) }
+
+		assertNull(result)
+	}
+
+	@Test
+	fun `concurrent starts launch one process`() = runBlocking<Unit> {
+		val launches = AtomicInteger()
+		val client = fakeServer(onLaunch = { launches.incrementAndGet() })
+
+		List(16) { thread { client.start() } }.forEach(Thread::join)
+		client.call("echo")
+
+		assertEquals(1, launches.get())
+	}
+
+	@Test
+	fun `closing while starting stops the launched process`() = runBlocking<Unit> {
+		val launching = CountDownLatch(1)
+		val release = CountDownLatch(1)
+		val client = fakeServer(onLaunch = { launching.countDown(); release.await() })
+		client.start()
+		launching.await()
+
+		client.close()
+		release.countDown()
+		delay(500)
+
+		assertEquals(ProcessRpcState.Stopped, client.state.value)
+		eventually { fakeChildren().isEmpty() }
+	}
+
+	@Test
+	fun `a malformed message body is skipped`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+
+		val result = client.call("garbage")
+
+		assertEquals(true, result.jsonObject.getValue("survived").jsonPrimitive.content.toBoolean())
+	}
+
+	@Test
+	fun `a framing error marks the client unavailable and stops the child`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+		val pid = readyPid(client)
+
+		val error = withTimeout(5_000) { assertFailsWith<ProcessRpcException> { client.call("badFrame") } }
+
+		assertTrue(error.message.orEmpty().contains("protocol error"))
+		assertIs<ProcessRpcState.Unavailable>(client.state.value)
+		eventually { !isAlive(pid) }
+	}
+
+	@Test
+	fun `a crashed child fails pending calls`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+
+		val error = withTimeout(5_000) { assertFailsWith<ProcessRpcException> { client.call("exit") } }
+
+		assertTrue(error.message.orEmpty().contains("exited"))
+	}
+
+	@Test
+	fun `closing fails in-flight calls`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+		client.call("echo")
+		val call = scope.async { runCatching { client.call("slow", buildJsonObject { put("millis", 5_000) }) } }
+		delay(300)
+
+		client.close()
+
+		val error = withTimeout(2_000) { call.await() }.exceptionOrNull()
+		assertIs<ProcessRpcException>(error)
+		assertTrue(error.message.orEmpty().contains("stopped"))
+	}
+
+	@Test
+	fun `a single-threaded scope is not blocked by the reader`() = runBlocking<Unit> {
+		val executor = Executors.newSingleThreadExecutor()
+		cleanups += { executor.shutdownNow() }
+		val client = fakeServer(scope = CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher()))
+		client.start()
+
+		val error = withTimeout(5_000) { client.call("askClient") }.jsonObject
+
+		assertEquals(-32601, error.getValue("code").jsonPrimitive.int)
+	}
+
+	@Test
+	fun `closing stops the child's descendants`() = runBlocking<Unit> {
+		val client = fakeServer()
+		client.start()
+		val sleeper = client.call("spawnSleeper").jsonObject.getValue("pid").jsonPrimitive.long
+
+		client.close()
+
+		eventually { !isAlive(sleeper) }
+	}
+
+	@Test
+	fun `stop lets the child exit after closing its input`() = runBlocking<Unit> {
+		val client = fakeServer(shutdownTimeoutMs = 5_000)
+		client.start()
+		val pid = readyPid(client)
+
+		val started = System.nanoTime()
+		client.stop()
+
+		assertTrue((System.nanoTime() - started) / 1_000_000 < 4_000)
+		assertEquals(ProcessRpcState.Stopped, client.state.value)
+		assertTrue(!isAlive(pid))
+	}
+
+	@Test
+	fun `closing kills a child that ignores termination`() = runBlocking<Unit> {
+		if (System.getProperty("os.name").startsWith("Windows")) return@runBlocking
+		val client = fakeServer(shutdownTimeoutMs = 500)
+		client.start()
+		val pid = readyPid(client)
+		client.call("ignoreTerm")
+
+		client.close()
+
+		eventually { !isAlive(pid) }
+	}
+
+	private suspend fun readyPid(client: ProcessRpcClient): Long {
+		client.call("echo")
+		return (client.state.value as ProcessRpcState.Ready).pid
+	}
+
+	private fun isAlive(pid: Long): Boolean = ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)
+
+	private fun fakeChildren(): List<ProcessHandle> = ProcessHandle.current().children()
+		.filter { it.info().commandLine().orElse("").contains("FakeRpcServerKt") }
+		.toList()
+
+	private suspend fun eventually(timeoutMs: Long = 5_000, condition: () -> Boolean) {
+		withTimeout(timeoutMs) {
+			while (!condition()) delay(50)
+		}
+	}
+
+	private fun fakeServer(
+		notificationBufferCapacity: Int = 1_024,
+		callTimeoutMs: Long = 10_000,
+		shutdownTimeoutMs: Long = 2_000,
+		scope: CoroutineScope = this.scope,
+		onLaunch: () -> Unit = {},
+	): ProcessRpcClient {
 		val java = ProcessHandle.current().info().command().orElse("java")
 		val classPath = System.getProperty("java.class.path")
 		return ProcessRpcClient(
-			command = { listOf(java, "-cp", classPath, "io.github.maniramezan.processrpc.FakeRpcServerKt") },
+			command = {
+				onLaunch()
+				listOf(java, "-cp", classPath, "io.github.maniramezan.processrpc.FakeRpcServerKt")
+			},
 			scope = scope,
 			callTimeoutMs = callTimeoutMs,
 			notificationBufferCapacity = notificationBufferCapacity,
+			shutdownTimeoutMs = shutdownTimeoutMs,
 		).also(clients::add)
 	}
 }

@@ -14,7 +14,11 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /** A scripted JSON-RPC child used by [ProcessRpcClientTest]; launched in its own JVM. */
-fun main() {
+fun main(args: Array<String>) {
+	if (args.firstOrNull() == "sleep") {
+		Thread.sleep(60_000)
+		return
+	}
 	val input = BufferedInputStream(System.`in`)
 	var remembered: JsonElement = JsonNull
 	while (true) {
@@ -38,6 +42,34 @@ fun main() {
 			"slow" -> {
 				Thread.sleep(params.jsonObject.getValue("millis").jsonPrimitive.int.toLong())
 				respond(id, buildJsonObject { put("done", true) })
+			}
+			"fail" -> send(buildJsonObject {
+				put("jsonrpc", "2.0")
+				put("id", id ?: JsonNull)
+				put("error", buildJsonObject {
+					put("code", -32000)
+					put("message", "failed on purpose")
+					put("data", buildJsonObject { put("detail", "scripted") })
+				})
+			})
+			"garbage" -> {
+				ContentLengthFraming.writeMessage("not json".encodeToByteArray(), System.out)
+				respond(id, buildJsonObject { put("survived", true) })
+			}
+			"badFrame" -> {
+				System.out.write("Bogus: 1\r\n\r\n".encodeToByteArray())
+				System.out.flush()
+				Thread.sleep(60_000)
+			}
+			"spawnSleeper" -> {
+				val java = ProcessHandle.current().info().command().orElse("java")
+				val sleeper = ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "io.github.maniramezan.processrpc.FakeRpcServerKt", "sleep").start()
+				respond(id, buildJsonObject { put("pid", sleeper.pid()) })
+			}
+			"ignoreTerm" -> {
+				sun.misc.Signal.handle(sun.misc.Signal("TERM")) { }
+				respond(id, buildJsonObject { put("ignoring", true) })
+				Thread.sleep(60_000)
 			}
 			"exit" -> exitProcess(0)
 		}
