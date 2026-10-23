@@ -15,6 +15,8 @@ public object ContentLengthFraming {
 	/** The largest header block [readMessage] accepts before giving up on finding its end. */
 	public const val MAX_HEADER_BYTES: Int = 8 * 1024
 
+	private const val HEADER_TERMINATOR = 0x0D0A0D0A
+
 	public fun readMessage(input: BufferedInputStream, maxMessageBytes: Int = DEFAULT_MAX_MESSAGE_BYTES): ByteArray? {
 		val header = readHeader(input) ?: return null
 		val length = header.lineSequence()
@@ -36,19 +38,23 @@ public object ContentLengthFraming {
 		output.flush()
 	}
 
+	// Tracks the last four bytes in an Int so finding the blank line costs no allocation per byte.
 	private fun readHeader(input: BufferedInputStream): String? {
-		val bytes = ArrayList<Byte>()
+		var header = ByteArray(64)
+		var size = 0
+		var lastFour = 0
 		while (true) {
 			val byte = input.read()
 			if (byte == -1) {
-				if (bytes.isEmpty()) return null
+				if (size == 0) return null
 				throw EOFException("Stream closed mid-header")
 			}
-			bytes += byte.toByte()
-			if (bytes.size >= 4 && bytes.takeLast(4) == listOf(13, 10, 13, 10).map(Int::toByte)) break
-			if (bytes.size > MAX_HEADER_BYTES) throw FramingException("Header exceeds $MAX_HEADER_BYTES bytes without a blank line")
+			if (size == MAX_HEADER_BYTES) throw FramingException("Header exceeds $MAX_HEADER_BYTES bytes without a blank line")
+			if (size == header.size) header = header.copyOf(minOf(header.size * 2, MAX_HEADER_BYTES))
+			header[size++] = byte.toByte()
+			lastFour = (lastFour shl 8) or byte
+			if (lastFour == HEADER_TERMINATOR) return header.decodeToString(0, size)
 		}
-		return bytes.toByteArray().decodeToString()
 	}
 
 	private fun BufferedInputStream.readExactly(length: Int): ByteArray {
