@@ -184,7 +184,7 @@ public class ProcessRpcClient(
 	 * for the launch. Does nothing while the child is starting or ready.
 	 */
 	public fun start() {
-		launch(restartOf = null)
+		begin(restartOf = null)
 	}
 
 	/**
@@ -289,7 +289,7 @@ public class ProcessRpcClient(
 	}
 
 	// restartOf is null for an explicit start(), or the generation whose failure the restart policy is replacing.
-	private fun launch(restartOf: Long?) {
+	private fun begin(restartOf: Long?) {
 		val launched = synchronized(lifecycleLock) {
 			if (restartOf == null) {
 				val current = mutableState.value
@@ -419,7 +419,7 @@ public class ProcessRpcClient(
 		}
 		scope.launch(Dispatchers.IO) {
 			delay(delayMs)
-			launch(restartOf = launched)
+			begin(restartOf = launched)
 		}
 	}
 
